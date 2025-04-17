@@ -14,6 +14,7 @@ import threading
 import time
 import posthog
 import uuid
+from pydub import AudioSegment
 
 # Load environment variables
 load_dotenv()
@@ -176,6 +177,48 @@ class WhatsAppBot:
             if os.path.exists(audio_path):
                 os.unlink(audio_path)
 
+    def convert_document_to_mp3(self, document_id):
+        """Convert a document to MP3 format."""
+        try:
+            # First, get the document URL
+            url = f'{self.base_url}/{document_id}'
+            headers = {
+                'Authorization': f'Bearer {self.api_token}'
+            }
+            response = requests.get(url, headers=headers)
+            response.raise_for_status()
+            media_url = response.json()['url']
+
+            # Download the document
+            response = requests.get(media_url, headers=headers)
+            response.raise_for_status()
+            
+            # Create temporary files
+            temp_input = tempfile.NamedTemporaryFile(delete=False)
+            temp_output = tempfile.NamedTemporaryFile(suffix='.mp3', delete=False)
+            
+            try:
+                # Save the downloaded document
+                temp_input.write(response.content)
+                temp_input.close()
+                
+                # Convert to MP3
+                audio = AudioSegment.from_file(temp_input.name)
+                audio.export(temp_output.name, format="mp3")
+                
+                return temp_output.name
+            finally:
+                # Clean up the input file
+                if os.path.exists(temp_input.name):
+                    os.unlink(temp_input.name)
+                
+        except Exception as e:
+            logging.error(f"Error converting document to MP3: {str(e)}")
+            # Clean up output file if it exists
+            if 'temp_output' in locals() and os.path.exists(temp_output.name):
+                os.unlink(temp_output.name)
+            return None
+
     def process_message(self, message, queue_timestamp):
         """Process a single WhatsApp message."""
         try:
@@ -211,65 +254,84 @@ class WhatsAppBot:
             # Capture message received event
             capture_event(job_id, "message-received", event_props)
             
-            # Only process voice messages
-            if message_data.get('type') != 'audio':
-                logging.info(f"Ignoring non-voice message of type: {message_data.get('type')} from {from_number}")
-                # Reply to non-audio messages
-                self.send_reply(from_number, message_id, "נכון להיום אני יודע לתמלל הקלטות, לא מעבר לזה.")
-                return True  # Return True to delete from queue
+            # Handle different message types
+            message_type = message_data.get('type')
+            audio_path = None
             
-            # Process audio message
-            media_id = message_data['audio']['id']
-            
-            # Download and process the audio
-            audio_path = self.download_audio(media_id)
             try:
-                # Check audio duration first
-                duration = self.check_audio_duration(audio_path)
-                if duration is None:
-                    logging.error(f"Failed to get duration for audio from {from_number}")
-                    self.send_reply(from_number, message_id, "אירעה שגיאה בבדיקת אורך הקובץ.")
+                if message_type == 'audio':
+                    # Process audio message
+                    media_id = message_data['audio']['id']
+                    audio_path = self.download_audio(media_id)
+                elif message_type == 'document':
+                    # Try to convert document to MP3
+                    media_id = message_data['document']['id']
+                    audio_path = self.convert_document_to_mp3(media_id)
+                    if audio_path:
+                        message_type = 'audio'  # Update type for further processing
+                else:
+                    logging.info(f"Ignoring non-voice message of type: {message_type} from {from_number}")
+                    self.send_reply(from_number, message_id, "נכון להיום אני יודע לתמלל הקלטות, לא מעבר לזה.")
                     return True
                 
-                # Log duration
-                logging.info(f"Audio duration for {from_number}: {duration:.2f} seconds")
-                event_props["audio_duration_seconds"] = duration
-                
-                # Check if audio is longer than 5 minutes (300 seconds)
-                if duration > 300:
-                    logging.info(f"Audio from {from_number} too long: {duration:.2f} seconds")
-                    self.send_reply(from_number, message_id, "אני מתנצל, אך קיבלתי הנחיה שלא לתמלל קבצים שארוכים מ-5 דקות.")
+                if not audio_path:
+                    logging.info(f"Could not process message of type: {message_type} from {from_number}")
+                    self.send_reply(from_number, message_id, "נכון להיום אני יודע לתמלל הקלטות, לא מעבר לזה.")
                     return True
                 
-                # If audio is valid, proceed with processing
-                self.send_reply(from_number, message_id, "אני על זה!")
-                logging.info(f"Starting transcription for {from_number}")
+                # Process the audio file
+                try:
+                    # Check audio duration first
+                    duration = self.check_audio_duration(audio_path)
+                    if duration is None:
+                        logging.error(f"Failed to get duration for audio from {from_number}")
+                        self.send_reply(from_number, message_id, "אירעה שגיאה בבדיקת אורך הקובץ.")
+                        return True
+                    
+                    # Log duration
+                    logging.info(f"Audio duration for {from_number}: {duration:.2f} seconds")
+                    event_props["audio_duration_seconds"] = duration
+                    
+                    # Check if audio is longer than 5 minutes (300 seconds)
+                    if duration > 300:
+                        logging.info(f"Audio from {from_number} too long: {duration:.2f} seconds")
+                        self.send_reply(from_number, message_id, "אני מתנצל, אך קיבלתי הנחיה שלא לתמלל קבצים שארוכים מ-5 דקות.")
+                        return True
+                    
+                    # If audio is valid, proceed with processing
+                    self.send_reply(from_number, message_id, "אני על זה!")
+                    logging.info(f"Starting transcription for {from_number}")
+                    
+                    # Record start time for transcription
+                    transcription_start = datetime.now(timezone.utc)
+                    
+                    response_text = self.process_audio_message(audio_path)
+                    
+                    # Calculate transcription time
+                    transcription_time = (datetime.now(timezone.utc) - transcription_start).total_seconds()
+                    
+                    # Capture transcription event
+                    transcription_props = {
+                        "user": from_number,
+                        "audio_duration_seconds": duration,
+                        "transcription_seconds": transcription_time
+                    }
+                    capture_event(job_id, "transcribe-done", transcription_props)
+                    
+                    logging.info(f"Completed transcription for {from_number}")
+                    response_text = "\N{SPEAKING HEAD IN SILHOUETTE}\N{MEMO}: " + response_text
+                    self.send_reply(from_number, message_id, response_text)
+                finally:
+                    # Ensure the audio file is deleted even if processing fails
+                    if audio_path and os.path.exists(audio_path):
+                        os.unlink(audio_path)
                 
-                # Record start time for transcription
-                transcription_start = datetime.now(timezone.utc)
-                
-                response_text = self.process_audio_message(audio_path)
-                
-                # Calculate transcription time
-                transcription_time = (datetime.now(timezone.utc) - transcription_start).total_seconds()
-                
-                # Capture transcription event
-                transcription_props = {
-                    "user": from_number,
-                    "audio_duration_seconds": duration,
-                    "transcription_seconds": transcription_time
-                }
-                capture_event(job_id, "transcribe-done", transcription_props)
-                
-                logging.info(f"Completed transcription for {from_number}")
-                response_text = "\N{SPEAKING HEAD IN SILHOUETTE}\N{MEMO}: " + response_text
-                self.send_reply(from_number, message_id, response_text)
-            finally:
-                # Ensure the audio file is deleted even if processing fails
-                if os.path.exists(audio_path):
+                return True
+            except Exception as e:
+                logging.error(f"Error processing message: {str(e)}")
+                if audio_path and os.path.exists(audio_path):
                     os.unlink(audio_path)
-            
-            return True
+                return False
         except Exception as e:
             logging.error(f"Error processing message: {str(e)}")
             return False
