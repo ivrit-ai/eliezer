@@ -14,6 +14,8 @@ import threading
 import time
 import posthog
 import uuid
+import random
+import argparse
 from pydub import AudioSegment
 
 # Load environment variables
@@ -45,7 +47,7 @@ def capture_event(distinct_id, event, props=None):
     ph.capture(distinct_id=distinct_id, event=event, properties=props)
 
 class WhatsAppBot:
-    def __init__(self):
+    def __init__(self, nudge_interval=100):
         self.sqs = boto3.client('sqs')
         self.queue_url = os.getenv('APP_SQS_QUEUE')
         self.api_token = os.getenv('WHATSAPP_API_TOKEN')
@@ -61,6 +63,13 @@ class WhatsAppBot:
         self.stop_event = threading.Event()
         self.worker_threads = []
         self.num_workers = 3
+        
+        # Nudge interval for donation messages
+        self.nudge_interval = nudge_interval
+
+    def is_israeli_number(self, phone_number):
+        """Check if the phone number is an Israeli number (starts with 972)."""
+        return phone_number.startswith('972')
 
     def mark_message_as_read(self, message_id):
         """Mark a WhatsApp message as read."""
@@ -219,6 +228,19 @@ class WhatsAppBot:
                 os.unlink(temp_output.name)
             return None
 
+    def send_periodic_donation_nudge(self, to_number, message_id):
+        """Send a donation nudge message to the user with probability 1/nudge_interval."""
+        if random.random() >= (1.0 / self.nudge_interval):
+            return
+        
+        logging.info(f"Sending donation nudge to {to_number}")
+        donation_message = (
+            "אליעזר, וכל פרויקט ivrit.ai, אינם למטרות רווח ומבוססים על תרומות מהציבור.\n"
+            "אם נהניתם מהשירות, נודה לתמיכה מכם, כאן: https://patreon.com/ivrit_ai.\n\n"          
+            "תודה רבה! 🙏🏻"
+        )
+        self.send_reply(to_number, message_id, donation_message)
+
     def process_message(self, message, queue_timestamp):
         """Process a single WhatsApp message."""
         try:
@@ -241,6 +263,12 @@ class WhatsAppBot:
             
             # Log incoming message
             logging.info(f"Incoming message from {from_number} - Message ID: {message_id}")
+            
+            # Check if the number is Israeli
+            if not self.is_israeli_number(from_number):
+                logging.info(f"Rejecting non-Israeli number: {from_number}")
+                self.send_reply(from_number, message_id, "מצטערים, השירות זמין רק למספרי טלפון ישראליים.")
+                return True  # Return True to delete from queue
             
             # Mark message as read
             self.mark_message_as_read(message_id)
@@ -319,8 +347,14 @@ class WhatsAppBot:
                     capture_event(job_id, "transcribe-done", transcription_props)
                     
                     logging.info(f"Completed transcription for {from_number}")
-                    response_text = "\N{SPEAKING HEAD IN SILHOUETTE}\N{MEMO}: " + response_text
+                    # We used to have an awesome speaking header silhouette.
+                    # Removed so people can copy-and-paste the transcription easily.
+                    #response_text = "\N{SPEAKING HEAD IN SILHOUETTE}\N{MEMO}: " + response_text
                     self.send_reply(from_number, message_id, response_text)
+                    
+                    # Send donation nudge with probability 1/nudge_interval
+                    self.send_periodic_donation_nudge(from_number, message_id)
+                        
                 finally:
                     # Ensure the audio file is deleted even if processing fails
                     if audio_path and os.path.exists(audio_path):
@@ -403,5 +437,11 @@ class WhatsAppBot:
             logging.info("Shutdown complete")
 
 if __name__ == "__main__":
-    bot = WhatsAppBot()
+    # Parse command line arguments
+    parser = argparse.ArgumentParser(description='WhatsApp Bot for audio transcription')
+    parser.add_argument('--nudge-interval', type=int, default=100, help='Interval for donation nudges (1:N probability)')
+    args = parser.parse_args()
+    
+    # Initialize and run the bot
+    bot = WhatsAppBot(nudge_interval=args.nudge_interval)
     bot.run() 
