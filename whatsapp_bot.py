@@ -22,15 +22,26 @@ import collections
 # Load environment variables
 load_dotenv()
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(threadName)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler('whatsapp_bot.log'),
-        logging.StreamHandler()
-    ]
-)
+# Configure logging with a custom formatter that includes file name and line number
+class FileLineFormatter(logging.Formatter):
+    def format(self, record):
+        # Get the relative path of the file
+        filepath = record.pathname
+        filename = os.path.basename(filepath)
+        
+        # Format the log message with file name, line number, thread name, and message
+        return f"{filename:<20}:{record.lineno:<4} {self.formatTime(record)} [{record.threadName}] {record.levelname} - {record.getMessage()}"
+
+# Create a file handler that only writes to file
+file_handler = logging.FileHandler('whatsapp_bot.log')
+file_handler.setFormatter(FileLineFormatter())
+
+# Create a logger
+logger = logging.getLogger('whatsapp_bot')
+logger.setLevel(logging.INFO)
+logger.addHandler(file_handler)
+# Prevent propagation to the root logger (which would output to console)
+logger.propagate = False
 
 ph = None
 if "POSTHOG_API_KEY" in os.environ:
@@ -104,6 +115,9 @@ class WhatsAppBot:
         self.stop_event = threading.Event()
         self.worker_threads = []
         self.num_workers = 3
+        
+        # Logger
+        self.logger = logging.getLogger('whatsapp_bot')
         
         # Nudge interval for donation messages
         self.nudge_interval = nudge_interval
@@ -228,7 +242,7 @@ class WhatsAppBot:
             duration = float(result.stdout.strip())
             return duration
         except Exception as e:
-            logging.error(f"Error checking audio duration: {str(e)}")
+            self.logger.error(f"Error checking audio duration: {str(e)}")
             return None
 
     def process_audio_message(self, audio_path):
@@ -278,18 +292,18 @@ class WhatsAppBot:
                     os.unlink(temp_input.name)
                 
         except Exception as e:
-            logging.error(f"Error converting document to MP3: {str(e)}")
+            self.logger.error(f"Error converting document to MP3: {str(e)}")
             # Clean up output file if it exists
             if 'temp_output' in locals() and os.path.exists(temp_output.name):
                 os.unlink(temp_output.name)
             return None
 
-    def send_periodic_donation_nudge(self, to_number, message_id):
+    def send_periodic_donation_nudge(self, to_number):
         """Send a donation nudge message to the user with probability 1/nudge_interval."""
         if random.random() >= (1.0 / self.nudge_interval):
             return
         
-        logging.info(f"Sending donation nudge to {to_number}")
+        self.logger.info(f"Sending donation nudge to {to_number}")
         donation_message = (
             "אליעזר, וכל פרויקט ivrit.ai, אינם למטרות רווח ומבוססים על תרומות מהציבור.\n"
             "אם נהניתם מהשירות, נודה לתמיכה מכם, כאן: https://patreon.com/ivrit_ai\n\n"          
@@ -310,7 +324,7 @@ class WhatsAppBot:
     def cleanup_full_buckets(self):
         """Remove full buckets to avoid memory congestion."""
         with self.bucket_lock:
-            logging.info(f"Starting bucket cleanup, {len(self.user_buckets)} buckets in memory")
+            self.logger.info(f"Starting bucket cleanup, {len(self.user_buckets)} buckets in memory")
 
             full_buckets = []
             for user_id, bucket in self.user_buckets.items():
@@ -321,9 +335,9 @@ class WhatsAppBot:
                 del self.user_buckets[user_id]
             
             if full_buckets:
-                logging.info(f"Cleaned up {len(full_buckets)} full buckets")
+                self.logger.info(f"Cleaned up {len(full_buckets)} full buckets")
 
-    def process_message(self, message, queue_timestamp):
+    def process_message(self, message):
         """Process a single WhatsApp message."""
         try:
             # Extract message details
@@ -343,11 +357,11 @@ class WhatsAppBot:
             job_id = str(uuid.uuid4())
             
             # Log incoming message
-            logging.info(f"Incoming message from {from_number} - Message ID: {message_id}")
+            self.logger.info(f"Incoming message from {from_number}")
             
             # Check if the number is Israeli
             if not self.is_israeli_number(from_number):
-                logging.info(f"Rejecting non-Israeli number: {from_number}")
+                self.logger.info(f"Rejecting non-Israeli number: {from_number}")
                 self.send_reply(from_number, message_id, "מצטערים, השירות זמין רק למספרי טלפון ישראליים.")
                 return True  # Return True to delete from queue
             
@@ -379,12 +393,12 @@ class WhatsAppBot:
                     if audio_path:
                         message_type = 'audio'  # Update type for further processing
                 else:
-                    logging.info(f"Ignoring non-voice message of type: {message_type} from {from_number}")
+                    self.logger.info(f"Ignoring non-voice message of type: {message_type} from {from_number}")
                     self.send_reply(from_number, message_id, "נכון להיום אני יודע לתמלל הקלטות, לא מעבר לזה.")
                     return True
                 
                 if not audio_path:
-                    logging.info(f"Could not process message of type: {message_type} from {from_number}")
+                    self.logger.info(f"Could not process message of type: {message_type} from {from_number}")
                     self.send_reply(from_number, message_id, "נכון להיום אני יודע לתמלל הקלטות, לא מעבר לזה.")
                     return True
                 
@@ -393,24 +407,24 @@ class WhatsAppBot:
                     # Check audio duration first
                     duration = self.check_audio_duration(audio_path)
                     if duration is None:
-                        logging.error(f"Failed to get duration for audio from {from_number}")
+                        self.logger.error(f"Failed to get duration for audio from {from_number}")
                         self.send_reply(from_number, message_id, "אירעה שגיאה בבדיקת אורך הקובץ.")
                         return True
                     
                     # Log duration
-                    logging.info(f"Audio duration for {from_number}: {duration:.2f} seconds")
+                    self.logger.info(f"Audio duration for {from_number}: {duration:.2f} seconds")
                     event_props["audio_duration_seconds"] = duration
                     
                     # Check if audio is longer than 5 minutes (300 seconds)
                     if duration > 300:
-                        logging.info(f"Audio from {from_number} too long: {duration:.2f} seconds")
+                        self.logger.info(f"Audio from {from_number} too long: {duration:.2f} seconds")
                         self.send_reply(from_number, message_id, "אני מתנצל, אך קיבלתי הנחיה שלא לתמלל קבצים שארוכים מ-5 דקות.")
                         return True
                     
                     # Check rate limits using leaky bucket
                     user_bucket = self.get_user_bucket(from_number)
                     if not user_bucket.can_transcribe(duration):
-                        logging.info(f"Rate limit exceeded for {from_number}")
+                        self.logger.info(f"Rate limit exceeded for {from_number}")
                         
                         # Calculate remaining time in minutes (approximate)
                         if user_bucket.messages_remaining == 0:
@@ -437,7 +451,7 @@ class WhatsAppBot:
                     
                     # If audio is valid, proceed with processing
                     self.send_reply(from_number, message_id, "אני על זה!")
-                    logging.info(f"Starting transcription for {from_number}")
+                    self.logger.info(f"Starting transcription for {from_number}")
                     
                     # Record start time for transcription
                     transcription_start = datetime.now(timezone.utc)
@@ -466,14 +480,14 @@ class WhatsAppBot:
                     }
                     capture_event(job_id, "transcribe-done", transcription_props)
                     
-                    logging.info(f"Completed transcription #{current_count} for {from_number} (Total duration: {total_duration_minutes:.1f} minutes)")
+                    self.logger.info(f"Completed transcription #{current_count} for {from_number} (Total duration: {total_duration_minutes:.1f} minutes)")
                     # We used to have an awesome speaking header silhouette.
                     # Removed so people can copy-and-paste the transcription easily.
                     #response_text = "\N{SPEAKING HEAD IN SILHOUETTE}\N{MEMO}: " + response_text
                     self.send_reply(from_number, message_id, response_text)
                     
                     # Send donation nudge with probability 1/nudge_interval
-                    self.send_periodic_donation_nudge(from_number, message_id)
+                    self.send_periodic_donation_nudge(from_number)
                     
                     # Perform deterministic cleanup after sending all messages
                     if self.transcription_counter % self.cleanup_frequency == 0:
@@ -486,18 +500,21 @@ class WhatsAppBot:
                 
                 return True
             except Exception as e:
-                logging.error(f"Error processing message: {str(e)}")
+                self.logger.error(f"Error processing message: {str(e)}")
                 if audio_path and os.path.exists(audio_path):
                     os.unlink(audio_path)
                 return False
         except Exception as e:
-            logging.error(f"Error processing message: {str(e)}")
+            self.logger.error(f"Error processing message: {str(e)}")
             return False
 
     def worker(self, worker_id):
         """Worker thread function to poll SQS and process messages."""
         thread_name = f"Worker-{worker_id}"
-        logging.info(f"Starting {thread_name}")
+        # Set thread name
+        threading.current_thread().name = thread_name
+        
+        self.logger.info("Starting worker thread")
         
         while not self.stop_event.is_set():
             try:
@@ -515,23 +532,26 @@ class WhatsAppBot:
                             message_body = json.loads(message['Body'])
                             
                             # Process the message
-                            if self.process_message(message_body, None):
+                            if self.process_message(message_body):
                                 # Delete message from queue if processed successfully
                                 self.sqs.delete_message(
                                     QueueUrl=self.queue_url,
                                     ReceiptHandle=message['ReceiptHandle']
                                 )
-                        except Exception as e:
-                            logging.error(f"Error processing message in {thread_name}: {str(e)}")
+                        except Exception as e:                                
+                            self.logger.error(f"Error processing message: {str(e)}")
                 
             except Exception as e:
-                logging.error(f"Error in {thread_name}: {str(e)}")
+                self.logger.error(f"Error in worker thread: {str(e)}")
                 time.sleep(5)  # Wait a bit before retrying
                 continue
 
     def run(self):
         """Start worker threads to poll SQS."""
-        logging.info(f"Starting WhatsApp bot with {self.num_workers} workers...")
+        # Set main thread name
+        threading.current_thread().name = "Main"
+        
+        self.logger.info(f"Starting WhatsApp bot with {self.num_workers} workers...")
         
         # Start worker threads
         for i in range(self.num_workers):
@@ -543,7 +563,7 @@ class WhatsAppBot:
             )
             self.worker_threads.append(thread)
             thread.start()
-            logging.info(f"Started thread {thread.name}")
+            self.logger.info(f"Started thread {thread.name}")
         
         try:
             # Keep the main thread alive
@@ -551,14 +571,14 @@ class WhatsAppBot:
                 time.sleep(1)
                 
         except KeyboardInterrupt:
-            logging.info("Shutting down...")
+            self.logger.info("Shutting down...")
             self.stop_event.set()
             
             # Wait for all threads to finish
             for thread in self.worker_threads:
                 thread.join()
             
-            logging.info("Shutdown complete")
+            self.logger.info("Shutdown complete")
 
 if __name__ == "__main__":
     # Parse command line arguments
