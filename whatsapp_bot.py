@@ -254,8 +254,15 @@ class WhatsAppBot:
         """Process the audio message and generate a response."""
         try:
             # Transcribe the audio
-            transcription = self.transcribe_audio(audio_path)
-            return transcription
+            try:
+                transcription = self.transcribe_audio(audio_path)
+                if not transcription or transcription.strip() == "":
+                    self.logger.warning("Transcription returned empty text")
+                    return "התמלול לא החזיר טקסט. ייתכן שההקלטה שקטה מדי."
+                return transcription
+            except Exception as e:
+                self.logger.error(f"Transcription failed: {str(e)}")
+                return "אירעה שגיאה בתמלול ההקלטה."
         finally:
             # Clean up the temporary file
             if os.path.exists(audio_path):
