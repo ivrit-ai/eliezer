@@ -18,6 +18,8 @@ import random
 import argparse
 from pydub import AudioSegment
 import collections
+import phonenumbers
+from phonenumbers import region_code_for_number, country_code_for_region
 
 # Load environment variables
 load_dotenv()
@@ -136,9 +138,36 @@ class WhatsAppBot:
         self.user_buckets = {}
         self.bucket_lock = threading.Lock()
 
-    def is_israeli_number(self, phone_number):
-        """Check if the phone number is an Israeli number (starts with 972)."""
-        return phone_number.startswith('972')
+    def is_allowed_region(self, phone_number):
+        """Check if the phone number is from an allowed region (Israeli, American/Canadian, or European)."""
+        try:
+            # Parse the phone number
+            parsed_number = phonenumbers.parse("+" + phone_number)
+            
+            # Get the region code (e.g., 'US', 'IL', 'GB')
+            region = region_code_for_number(parsed_number)
+            
+            # List of allowed regions - North America, Europe, and Israel combined
+            allowed_regions = [
+                # North America
+                'US', 'CA',
+                
+                # Europe (EU countries and other European countries)
+                'AT', 'BE', 'BG', 'HR', 'CY', 'CZ', 'DK', 'EE', 'FI', 'FR', 'DE', 'GR', 'HU', 
+                'IE', 'IT', 'LV', 'LT', 'LU', 'MT', 'NL', 'PL', 'PT', 'RO', 'SK', 'SI', 'ES', 
+                'SE', 'GB', 'IS', 'LI', 'NO', 'CH', 'AL', 'AD', 'BA', 'BY', 'FO', 'GI', 'VA',
+                'IM', 'JE', 'XK', 'MK', 'MD', 'MC', 'ME', 'RU', 'SM', 'RS', 'SJ', 'TR', 'UA',
+                
+                # Israel
+                'IL'
+            ]
+            
+            # Check if the region is in the allowed list
+            return region in allowed_regions
+            
+        except phonenumbers.phonenumberutil.NumberParseException:
+            self.logger.error(f"Failed to parse phone number: {phone_number}")
+            return False
 
     def mark_message_as_read(self, message_id):
         """Mark a WhatsApp message as read."""
@@ -371,10 +400,10 @@ class WhatsAppBot:
             # Log incoming message
             self.logger.info(f"Incoming message from {from_number}")
             
-            # Check if the number is Israeli
-            if not self.is_israeli_number(from_number):
-                self.logger.info(f"Rejecting non-Israeli number: {from_number}")
-                self.send_reply(from_number, message_id, "מצטערים, השירות זמין רק למספרי טלפון ישראליים.")
+            # Check if the number is allowed
+            if not self.is_allowed_region(from_number):
+                self.logger.info(f"Rejecting non-allowed number: {from_number}")
+                self.send_reply(from_number, message_id, "מצטערים, השירות זמין רק כרגע למספרי טלפון מישראל, אירופה וצפון אמריקה.")
                 return True  # Return True to delete from queue
             
             # Mark message as read
