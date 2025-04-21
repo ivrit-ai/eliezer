@@ -177,7 +177,12 @@ class WhatsAppBot:
             data['context'] = { 'message_id': message_id }
 
         response = requests.post(url, headers=headers, json=data)
-        response.raise_for_status()
+        try:
+            response.raise_for_status()
+        except requests.exceptions.HTTPError as e:
+            self.logger.error(f"Error sending message to {to_number}: Status {response.status_code}, Response: {response.text}")
+            print(f"Error sending message to {to_number}: Status {response.status_code}, Response: {response.text}")
+            raise
         return response.json()
 
     def download_audio(self, media_id):
