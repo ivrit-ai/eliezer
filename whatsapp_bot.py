@@ -114,7 +114,7 @@ class WhatsAppBot:
         # Thread control
         self.stop_event = threading.Event()
         self.worker_threads = []
-        self.num_workers = 3
+        self.num_workers = 10
         
         # Logger
         self.logger = logging.getLogger('whatsapp_bot')
