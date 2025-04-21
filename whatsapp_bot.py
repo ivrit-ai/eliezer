@@ -182,7 +182,12 @@ class WhatsAppBot:
             'message_id': message_id
         }
         response = requests.post(url, headers=headers, json=data)
-        response.raise_for_status()
+        try:
+            response.raise_for_status()
+        except requests.exceptions.HTTPError as e:
+            self.logger.error(f"Error marking message {message_id} as read: Status {response.status_code}, Response: {response.text}")
+            print(f"Error marking message {message_id} as read: Status {response.status_code}, Response: {response.text}")
+            raise
         return response.json()
 
     def send_reply(self, to_number, message_id, text):
@@ -405,10 +410,7 @@ class WhatsAppBot:
                 self.logger.info(f"Rejecting non-allowed number: {from_number}")
                 self.send_reply(from_number, message_id, "מצטערים, השירות זמין רק כרגע למספרי טלפון מישראל, אירופה וצפון אמריקה.")
                 return True  # Return True to delete from queue
-            
-            # Mark message as read
-            self.mark_message_as_read(message_id)
-            
+                        
             # Initialize event properties
             event_props = {
                 "user": from_number,
@@ -421,6 +423,12 @@ class WhatsAppBot:
             # Handle different message types
             message_type = message_data.get('type')
             audio_path = None
+            
+            # Mark message as read
+            if message_type in ['audio', 'document', 'text']:
+                self.mark_message_as_read(message_id)
+            else:
+                return True
             
             try:
                 if message_type == 'audio':
