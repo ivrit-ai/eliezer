@@ -191,7 +191,43 @@ class WhatsAppBot:
         return response.json()
 
     def send_reply(self, to_number, message_id, text):
-        """Send a reply message with quote."""
+        """Send a reply message with quote. Splits long messages into chunks of 4096 characters."""
+        # Define the maximum message length
+        MAX_MESSAGE_LENGTH = 4096
+        
+        # If the message is shorter than the limit, send it as is
+        if len(text) <= MAX_MESSAGE_LENGTH:
+            return self._send_single_message(to_number, message_id, text)
+        
+        # Split the message into chunks
+        message_chunks = []
+        for i in range(0, len(text), MAX_MESSAGE_LENGTH):
+            message_chunks.append(text[i:i + MAX_MESSAGE_LENGTH])
+        
+        # Send each chunk as a separate message
+        responses = []
+        for i, chunk in enumerate(message_chunks):
+            # Only the first message should be in reply to the original message
+            chunk_message_id = message_id if i == 0 else None
+            
+            # Add part indicator if there are multiple chunks
+            if len(message_chunks) > 1:
+                chunk_with_indicator = f"[{i+1}/{len(message_chunks)}]\n{chunk}"
+            else:
+                chunk_with_indicator = chunk
+                
+            response = self._send_single_message(to_number, chunk_message_id, chunk_with_indicator)
+            responses.append(response)
+            
+            # Add a small delay between messages to prevent rate limiting
+            if i < len(message_chunks) - 1:
+                time.sleep(0.1)
+        
+        # Return the response from the last chunk
+        return responses[-1]
+    
+    def _send_single_message(self, to_number, message_id, text):
+        """Send a single WhatsApp message."""
         url = f'{self.base_url}/{self.phone_number_id}/messages'
         headers = {
             'Authorization': f'Bearer {self.api_token}',
