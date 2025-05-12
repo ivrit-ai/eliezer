@@ -191,9 +191,10 @@ class WhatsAppBot:
         return response.json()
 
     def send_reply(self, to_number, message_id, text):
-        """Send a reply message with quote. Splits long messages into chunks of 4096 characters."""
-        # Define the maximum message length
-        MAX_MESSAGE_LENGTH = 4096
+        """Send a reply message with quote. Splits long messages into chunks of 4000 characters."""
+        # Define the maximum message length.
+        # WhatsApp's maximu message length is 4096, so keep some distance from that limit.
+        MAX_MESSAGE_LENGTH = 4000
         
         # If the message is shorter than the limit, send it as is
         if len(text) <= MAX_MESSAGE_LENGTH:
@@ -295,8 +296,13 @@ class WhatsAppBot:
                 'engine': 'faster-whisper'
             }
             
-            # Run the transcription
-            result = self.runpod_endpoint.run_sync(payload)
+            # Run the transcription.
+            # Give it a few tries in case the server fails for any reason.
+            RUNPOD_RETRY = 3
+            for i in range(RUNPOD_RETRY):
+                result = self.runpod_endpoint.run_sync(payload)
+                if result:
+                    break
             
             # Extract the transcription from the result
             if len(result) == 1 and 'result' in result[0]:
