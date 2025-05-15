@@ -190,6 +190,31 @@ class WhatsAppBot:
             raise
         return response.json()
 
+    def send_reaction(self, to_number, message_id, emoji):
+        """Send a reaction (emoji) to a specific WhatsApp message."""
+        url = f'{self.base_url}/{self.phone_number_id}/messages'
+        headers = {
+            'Authorization': f'Bearer {self.api_token}',
+            'Content-Type': 'application/json'
+        }
+        data = {
+            'messaging_product': 'whatsapp',
+            'recipient_type': 'individual',
+            'to': to_number,
+            'type': 'reaction',
+            'reaction': {
+                'message_id': message_id,
+                'emoji': emoji
+            }
+        }
+        response = requests.post(url, headers=headers, json=data)
+        try:
+            response.raise_for_status()
+        except requests.exceptions.HTTPError as e:
+            self.logger.error(f"Error sending reaction to {to_number}: {response.status_code} - {response.text}")
+            raise
+        return response.json()
+
     def send_reply(self, to_number, message_id, text):
         """Send a reply message with quote. Splits long messages into chunks of 4000 characters."""
         # Define the maximum message length.
@@ -473,6 +498,11 @@ class WhatsAppBot:
                 return True
             
             try:
+                non_audio_message =  """
+                היי, שמתי לב ששלחת לי הודעת טקסט.\n
+                אני פה כדי לעזור עם הודעות קוליות ולתמלל בשבילך.\n
+                אולי התכוונת לשלוח למישהו אחר? קורה. רק שלא יפספסו את ההודעה שלך...
+                """
                 if message_type == 'audio':
                     # Process audio message
                     media_id = message_data['audio']['id']
@@ -485,12 +515,14 @@ class WhatsAppBot:
                         message_type = 'audio'  # Update type for further processing
                 else:
                     self.logger.info(f"Ignoring non-voice message of type: {message_type} from {from_number}")
-                    self.send_reply(from_number, message_id, "נכון להיום אני יודע לתמלל הקלטות, לא מעבר לזה.")
+                    self.send_reply(from_number, message_id, non_audio_message)
+                    self.send_reaction(from_number, message_id, "❌")
                     return True
                 
                 if not audio_path:
                     self.logger.info(f"Could not process message of type: {message_type} from {from_number}")
-                    self.send_reply(from_number, message_id, "נכון להיום אני יודע לתמלל הקלטות, לא מעבר לזה.")
+                    self.send_reply(from_number, message_id, non_audio_message)
+                    self.send_reaction(from_number, message_id, "❌")
                     return True
                 
                 # Process the audio file
@@ -541,7 +573,7 @@ class WhatsAppBot:
                         return True
                     
                     # If audio is valid, proceed with processing
-                    self.send_reply(from_number, message_id, "אני על זה!")
+                    self.send_reaction(from_number, message_id, "⏳")
                     self.logger.info(f"Starting transcription for {from_number}")
                     
                     # Record start time for transcription
@@ -576,7 +608,8 @@ class WhatsAppBot:
                     # Removed so people can copy-and-paste the transcription easily.
                     #response_text = "\N{SPEAKING HEAD IN SILHOUETTE}\N{MEMO}: " + response_text
                     self.send_reply(from_number, message_id, response_text)
-                    
+                    self.send_reaction(from_number, message_id, "✅")
+
                     # Send donation nudge with probability 1/nudge_interval
                     self.send_periodic_donation_nudge(from_number)
                     
