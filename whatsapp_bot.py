@@ -456,11 +456,12 @@ class WhatsAppBot:
             # Initialize event properties
             event_props = {
                 "user": from_number,
-                "type": message_data.get('type')
+                "type": message_data.get('type'),
+                "job_id": job_id
             }
             
             # Capture message received event
-            capture_event(job_id, "message-received", event_props)
+            capture_event(from_number, "message-received", event_props)
             
             # Handle different message types
             message_type = message_data.get('type')
@@ -531,9 +532,10 @@ class WhatsAppBot:
                             "user": from_number,
                             "messages_remaining": user_bucket.messages_remaining,
                             "seconds_remaining": user_bucket.seconds_remaining,
-                            "requested_duration": duration
+                            "requested_duration": duration,
+                            "job_id": job_id
                         }
-                        capture_event(job_id, "rate-limit-hit", limit_hit_props)
+                        capture_event(from_number, "rate-limit-hit", limit_hit_props)
                         
                         self.send_reply(from_number, message_id, 
                             f"מצטערים, אך הגעת למגבלת השימוש של השירות. "
@@ -567,9 +569,10 @@ class WhatsAppBot:
                         "user": from_number,
                         "audio_duration_seconds": duration,
                         "transcription_seconds": transcription_time,
-                        "has_resources_left": has_resources_left
+                        "has_resources_left": has_resources_left,
+                        "job_id": job_id
                     }
-                    capture_event(job_id, "transcribe-done", transcription_props)
+                    capture_event(from_number, "transcribe-done", transcription_props)
                     
                     self.logger.info(f"Completed transcription #{current_count} for {from_number} (Total duration: {total_duration_minutes:.1f} minutes)")
                     # We used to have an awesome speaking header silhouette.
