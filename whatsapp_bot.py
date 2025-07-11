@@ -507,10 +507,10 @@ class WhatsAppBot:
                     self.logger.info(f"Audio duration for {from_number}: {duration:.2f} seconds")
                     event_props["audio_duration_seconds"] = duration
                     
-                    # Check if audio is longer than 5 minutes (300 seconds)
-                    if duration > 300:
+                    # Check if audio is longer than 5 minutes (600 seconds)
+                    if duration > 600:
                         self.logger.info(f"Audio from {from_number} too long: {duration:.2f} seconds")
-                        self.send_reply(from_number, message_id, "אני מתנצל, אך קיבלתי הנחיה שלא לתמלל קבצים שארוכים מ-5 דקות.")
+                        self.send_reply(from_number, message_id, "אני מתנצל, אך קיבלתי הנחיה שלא לתמלל קבצים שארוכים מ-10 דקות.")
                         return True
                     
                     # Check rate limits using leaky bucket
