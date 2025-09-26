@@ -226,6 +226,32 @@ class WhatsAppBot:
         
         # Return the response from the last chunk
         return responses[-1]
+
+    def send_typing_indicator(self, message_id):
+        """Send a typing indicator to show the user that you're preparing a response."""
+        url = f'{self.base_url}/{self.phone_number_id}/messages'
+        headers = {
+            'Authorization': f'Bearer {self.api_token}',
+            'Content-Type': 'application/json'
+        }
+        data = {
+            'messaging_product': 'whatsapp',
+            'status': 'read',
+            'message_id': message_id,
+            'typing_indicator': {
+                'type': 'text'
+            }
+        }
+    
+        response = requests.post(url, headers=headers, json=data)
+        try:
+            response.raise_for_status()
+        except requests.exceptions.HTTPError as e:
+            self.logger.error(f"Error sending typing indicator: Status {response.status_code}, Response: {response.text}")
+            print(f"Error sending typing indicator: Status {response.status_code}, Response: {response.text}")
+            raise
+
+        return response.json()
     
     def _send_single_message(self, to_number, message_id, text):
         """Send a single WhatsApp message."""
@@ -543,10 +569,10 @@ class WhatsAppBot:
                         return True
                     
                     # If audio is valid, proceed with processing
-                    self.send_reply(from_number, message_id, "אני על זה!")
                     self.logger.info(f"Starting transcription for {from_number}")
                     
                     # Record start time for transcription
+                    self.set_typing_indicator(message_id)
                     transcription_start = datetime.now(timezone.utc)
                     
                     response_text = self.process_audio_message(audio_path)
