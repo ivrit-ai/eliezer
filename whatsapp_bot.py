@@ -533,7 +533,7 @@ class WhatsAppBot:
                     self.logger.info(f"Audio duration for {from_number}: {duration:.2f} seconds")
                     event_props["audio_duration_seconds"] = duration
                     
-                    # Check if audio is longer than 5 minutes (600 seconds)
+                    # Check if audio is longer than 10 minutes (600 seconds)
                     if duration > 600:
                         self.logger.info(f"Audio from {from_number} too long: {duration:.2f} seconds")
                         self.send_reply(from_number, message_id, "אני מתנצל, אך קיבלתי הנחיה שלא לתמלל קבצים שארוכים מ-10 דקות.")
@@ -704,8 +704,8 @@ if __name__ == "__main__":
     # Parse command line arguments
     parser = argparse.ArgumentParser(description='WhatsApp Bot for audio transcription')
     parser.add_argument('--nudge-interval', type=int, default=100, help='Interval for donation nudges (1:N probability)')
-    parser.add_argument('--user-max-messages-per-hour', type=float, default=0.5, help='Maximum messages per hour per user')
-    parser.add_argument('--user-max-minutes-per-hour', type=float, default=1.5, help='Maximum audio minutes per hour per user')
+    parser.add_argument('--user-max-messages-per-hour', type=float, default=10, help='Maximum messages per hour per user')
+    parser.add_argument('--user-max-minutes-per-hour', type=float, default=20, help='Maximum audio minutes per hour per user')
     parser.add_argument('--cleanup-frequency', type=int, default=50, help='Perform bucket cleanup every N transcriptions')
     args = parser.parse_args()
     
