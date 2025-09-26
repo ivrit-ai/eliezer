@@ -572,7 +572,7 @@ class WhatsAppBot:
                     self.logger.info(f"Starting transcription for {from_number}")
                     
                     # Record start time for transcription
-                    self.set_typing_indicator(message_id)
+                    self.send_typing_indicator(message_id)
                     transcription_start = datetime.now(timezone.utc)
                     
                     response_text = self.process_audio_message(audio_path)
