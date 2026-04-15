@@ -445,28 +445,34 @@ class WhatsAppBot:
             uptime_seconds = now - self.start_time
             messages_handled = self.messages_handled
 
-            # Prune entries older than 1 hour
-            one_hour_ago = now - 3600
-            while self.message_timestamps and self.message_timestamps[0] < one_hour_ago:
+            # Prune entries older than 24 hours
+            one_day_ago = now - 86400
+            while self.message_timestamps and self.message_timestamps[0] < one_day_ago:
                 self.message_timestamps.popleft()
-            while self.message_lengths and self.message_lengths[0][0] < one_hour_ago:
+            while self.message_lengths and self.message_lengths[0][0] < one_day_ago:
                 self.message_lengths.popleft()
 
-            # Messages per second over different windows
+            # Messages per minute over different windows
             timestamps = list(self.message_timestamps)
             one_minute_ago = now - 60
             five_minutes_ago = now - 300
+            one_hour_ago = now - 3600
 
             msgs_last_minute = sum(1 for t in timestamps if t >= one_minute_ago)
             msgs_last_5_minutes = sum(1 for t in timestamps if t >= five_minutes_ago)
-            msgs_last_hour = len(timestamps)
+            msgs_last_hour = sum(1 for t in timestamps if t >= one_hour_ago)
+            msgs_last_day = len(timestamps)
 
-            mps_1m = msgs_last_minute / 60.0
-            mps_5m = msgs_last_5_minutes / 300.0
-            mps_1h = msgs_last_hour / 3600.0
+            mpm_1m = float(msgs_last_minute)
+            mpm_5m = msgs_last_5_minutes / 5.0
+            mpm_1h = msgs_last_hour / 60.0
+            mpm_24h = msgs_last_day / 1440.0
+
+            # Total time transcribed
+            total_duration = self.total_duration
 
             # Message lengths (audio durations) over last hour
-            lengths = [duration for _, duration in self.message_lengths]
+            lengths = [duration for ts, duration in self.message_lengths if ts >= one_hour_ago]
             if lengths:
                 avg_length = sum(lengths) / len(lengths)
                 median_length = statistics.median(lengths)
@@ -489,13 +495,26 @@ class WhatsAppBot:
         uptime_parts.append(f"{seconds}s")
         uptime_str = " ".join(uptime_parts)
 
+        # Format total time transcribed
+        td_days, td_remainder = divmod(int(total_duration), 86400)
+        td_hours, td_remainder = divmod(td_remainder, 3600)
+        td_minutes, _ = divmod(td_remainder, 60)
+        transcribed_parts = []
+        if td_days > 0:
+            transcribed_parts.append(f"{td_days} days")
+        transcribed_parts.append(f"{td_hours} hours")
+        transcribed_parts.append(f"{td_minutes} minutes")
+        transcribed_str = ", ".join(transcribed_parts)
+
         status_text = (
             f"*Eliezer Status*\n\n"
             f"*Uptime:* {uptime_str}\n"
-            f"*Messages handled:* {messages_handled}\n\n"
-            f"*Messages/sec (1m):* {mps_1m:.3f}\n"
-            f"*Messages/sec (5m):* {mps_5m:.3f}\n"
-            f"*Messages/sec (1h):* {mps_1h:.3f}\n\n"
+            f"*Messages handled:* {messages_handled}\n"
+            f"*Total time transcribed:* {transcribed_str}\n\n"
+            f"*Messages/min (1m):* {mpm_1m:.1f}\n"
+            f"*Messages/min (5m):* {mpm_5m:.1f}\n"
+            f"*Messages/min (1h):* {mpm_1h:.2f}\n"
+            f"*Messages/min (24h):* {mpm_24h:.2f}\n\n"
             f"*Avg message length (1h):* {avg_length:.1f}s\n"
             f"*Median message length (1h):* {median_length:.1f}s"
         )
