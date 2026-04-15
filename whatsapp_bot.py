@@ -17,6 +17,7 @@ import random
 import argparse
 from pydub import AudioSegment
 import collections
+import statistics
 import phonenumbers
 from phonenumbers import region_code_for_number, country_code_for_region
 
@@ -132,6 +133,12 @@ class WhatsAppBot:
         self.transcription_counter = 0
         self.total_duration = 0
         self.counter_lock = threading.Lock()
+
+        # Statistics tracking
+        self.start_time = time.time()
+        self.messages_handled = 0
+        self.message_timestamps = collections.deque()  # timestamps of all incoming messages
+        self.message_lengths = collections.deque()  # (timestamp, audio_duration) for transcribed messages
         
         # Leaky bucket rate limiter settings
         self.user_max_messages_per_hour = user_max_messages_per_hour
@@ -430,6 +437,71 @@ class WhatsAppBot:
             if full_buckets:
                 self.logger.info(f"Cleaned up {len(full_buckets)} full buckets")
 
+    def handle_status_command(self, from_number, message_id):
+        """Handle the /status command by returning bot statistics."""
+        now = time.time()
+
+        with self.counter_lock:
+            uptime_seconds = now - self.start_time
+            messages_handled = self.messages_handled
+
+            # Prune entries older than 1 hour
+            one_hour_ago = now - 3600
+            while self.message_timestamps and self.message_timestamps[0] < one_hour_ago:
+                self.message_timestamps.popleft()
+            while self.message_lengths and self.message_lengths[0][0] < one_hour_ago:
+                self.message_lengths.popleft()
+
+            # Messages per second over different windows
+            timestamps = list(self.message_timestamps)
+            one_minute_ago = now - 60
+            five_minutes_ago = now - 300
+
+            msgs_last_minute = sum(1 for t in timestamps if t >= one_minute_ago)
+            msgs_last_5_minutes = sum(1 for t in timestamps if t >= five_minutes_ago)
+            msgs_last_hour = len(timestamps)
+
+            mps_1m = msgs_last_minute / 60.0
+            mps_5m = msgs_last_5_minutes / 300.0
+            mps_1h = msgs_last_hour / 3600.0
+
+            # Message lengths (audio durations) over last hour
+            lengths = [duration for _, duration in self.message_lengths]
+            if lengths:
+                avg_length = sum(lengths) / len(lengths)
+                median_length = statistics.median(lengths)
+            else:
+                avg_length = 0
+                median_length = 0
+
+        # Format uptime
+        days, remainder = divmod(int(uptime_seconds), 86400)
+        hours, remainder = divmod(remainder, 3600)
+        minutes, seconds = divmod(remainder, 60)
+
+        uptime_parts = []
+        if days > 0:
+            uptime_parts.append(f"{days}d")
+        if hours > 0:
+            uptime_parts.append(f"{hours}h")
+        if minutes > 0:
+            uptime_parts.append(f"{minutes}m")
+        uptime_parts.append(f"{seconds}s")
+        uptime_str = " ".join(uptime_parts)
+
+        status_text = (
+            f"*Eliezer Status*\n\n"
+            f"*Uptime:* {uptime_str}\n"
+            f"*Messages handled:* {messages_handled}\n\n"
+            f"*Messages/sec (1m):* {mps_1m:.3f}\n"
+            f"*Messages/sec (5m):* {mps_5m:.3f}\n"
+            f"*Messages/sec (1h):* {mps_1h:.3f}\n\n"
+            f"*Avg message length (1h):* {avg_length:.1f}s\n"
+            f"*Median message length (1h):* {median_length:.1f}s"
+        )
+
+        self.send_reply(from_number, message_id, status_text)
+
     def process_message(self, message):
         """Process a single WhatsApp message."""
         try:
@@ -467,7 +539,12 @@ class WhatsAppBot:
             
             # Capture message received event
             capture_event(from_number, "message-received", event_props)
-            
+
+            # Track message for statistics
+            with self.counter_lock:
+                self.messages_handled += 1
+                self.message_timestamps.append(time.time())
+
             # Handle different message types
             message_type = message_data.get('type')
             audio_path = None
@@ -490,6 +567,11 @@ class WhatsAppBot:
                     if audio_path:
                         message_type = 'audio'  # Update type for further processing
                 else:
+                    # Check for magic words
+                    text_body = message_data.get('text', {}).get('body', '').strip()
+                    if text_body == '/status':
+                        self.handle_status_command(from_number, message_id)
+                        return True
                     self.logger.info(f"Ignoring non-voice message of type: {message_type} from {from_number}")
                     self.send_reply(from_number, message_id, "נכון להיום אני יודע לתמלל הקלטות, לא מעבר לזה.")
                     return True
@@ -566,6 +648,7 @@ class WhatsAppBot:
                     with self.counter_lock:
                         self.transcription_counter += 1
                         self.total_duration += duration
+                        self.message_lengths.append((time.time(), duration))
                         current_count = self.transcription_counter
                         total_duration_minutes = self.total_duration / 60
 
