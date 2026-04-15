@@ -3,8 +3,7 @@ import json
 import boto3
 import requests
 import tempfile
-import base64
-import runpod
+import ivrit
 from dotenv import load_dotenv
 from pathlib import Path
 import subprocess
@@ -109,9 +108,14 @@ class WhatsAppBot:
         self.api_version = 'v22.0'
         self.base_url = f'https://graph.facebook.com/{self.api_version}'
         
-        # Initialize RunPod
-        runpod.api_key = os.getenv('RUNPOD_API_KEY')
-        self.runpod_endpoint = runpod.Endpoint(os.getenv('RUNPOD_ENDPOINT_ID'))
+        # Initialize transcription model
+        self.transcription_model = ivrit.load_model(
+            engine='runpod',
+            model='ivrit-ai/whisper-large-v3-turbo-ct2',
+            api_key=os.getenv('RUNPOD_API_KEY'),
+            endpoint_id=os.getenv('RUNPOD_ENDPOINT_ID'),
+            core_engine='faster-whisper',
+        )
         
         # Thread control
         self.stop_event = threading.Event()
@@ -305,40 +309,15 @@ class WhatsAppBot:
         return temp_file.name
 
     def transcribe_audio(self, audio_path):
-        """Transcribe audio using RunPod."""
+        """Transcribe audio using the ivrit package."""
         try:
-            # Read the audio file
-            with open(audio_path, 'rb') as audio_file:
-                audio_data = audio_file.read()
-            
-            # Encode the audio data as base64
-            encoded_data = base64.b64encode(audio_data).decode('utf-8')
-            
-            # Prepare the payload for RunPod
-            payload = {
-                'type': 'blob',
-                'data': encoded_data,
-                'model': 'ivrit-ai/whisper-large-v3-turbo_20250403_rc0-ct2',
-                'engine': 'faster-whisper'
-            }
-            
-            # Run the transcription.
-            # Give it a few tries in case the server fails for any reason.
-            RUNPOD_RETRY = 3
-            for i in range(RUNPOD_RETRY):
-                result = self.runpod_endpoint.run_sync(payload)
-                if result:
-                    break
-            
-            # Extract the transcription from the result
-            if len(result) == 1 and 'result' in result[0]:
-                text_result = '\n'.join([item['text'].strip() for item in result[0]['result']])
+            result = self.transcription_model.transcribe(path=audio_path, language='he')
+            text_result = '\n'.join(segment.text.strip() for segment in result['segments'])
+            if text_result:
                 return text_result
-            else:
-                print(f"Unexpected RunPod response format: {result}")
-                return "לא הצלחתי להבין את ההודעה הקולית."
+            return "לא הצלחתי להבין את ההודעה הקולית."
         except Exception as e:
-            print(f"Error transcribing audio: {str(e)}")
+            self.logger.error(f"Error transcribing audio: {e}")
             return "אירעה שגיאה בעיבוד ההודעה הקולית."
 
     def check_audio_duration(self, audio_path):

@@ -2,4 +2,4 @@ boto3==1.34.69
 python-dotenv==1.0.1
 requests==2.31.0
 python-tempfile==0.1.0
-runpod==1.5.0 
+ivrit==0.2.5
