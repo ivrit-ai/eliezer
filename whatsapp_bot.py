@@ -60,6 +60,13 @@ def capture_event(distinct_id, event, props=None):
 
     ph.capture(distinct_id=distinct_id, event=event, properties=props)
 
+# Timeouts for HTTP requests: (connect_timeout, read_timeout) in seconds
+REQUEST_TIMEOUT = (10, 30)
+DOWNLOAD_TIMEOUT = (10, 120)  # longer for media downloads
+SUBPROCESS_TIMEOUT = 30
+MONITOR_INTERVAL = 60  # seconds between thread status reports
+STALLED_THRESHOLD = 120  # seconds before a thread is flagged as possibly stuck
+
 class LeakyBucket:
     def __init__(self, max_messages_per_hour, max_minutes_per_hour):
         self.max_messages = max_messages_per_hour
@@ -101,7 +108,7 @@ class LeakyBucket:
                 self.seconds_remaining >= self.max_minutes * 0.95)
 
 class WhatsAppBot:
-    def __init__(self, nudge_interval, user_max_messages_per_hour, user_max_minutes_per_hour, cleanup_frequency):
+    def __init__(self, nudge_interval, user_max_messages_per_hour, user_max_minutes_per_hour, cleanup_frequency, debug=False):
         self.sqs = boto3.client('sqs')
         self.queue_url = os.getenv('APP_SQS_QUEUE')
         self.api_token = os.getenv('WHATSAPP_API_TOKEN')
@@ -149,6 +156,17 @@ class WhatsAppBot:
         self.user_buckets = {}
         self.bucket_lock = threading.Lock()
 
+        # Thread activity tracking for debugging
+        self.worker_activity = {}
+        self.activity_lock = threading.Lock()
+
+        # Debug mode
+        if debug:
+            self.logger.setLevel(logging.DEBUG)
+            console_handler = logging.StreamHandler()
+            console_handler.setFormatter(FileLineFormatter())
+            self.logger.addHandler(console_handler)
+
     def is_allowed_region(self, phone_number):
         """Check if the phone number is from an allowed region (Israeli, American/Canadian, or European)."""
         try:
@@ -192,7 +210,8 @@ class WhatsAppBot:
             'status': 'read',
             'message_id': message_id
         }
-        response = requests.post(url, headers=headers, json=data)
+        self.logger.debug(f"mark_message_as_read: {message_id}")
+        response = requests.post(url, headers=headers, json=data, timeout=REQUEST_TIMEOUT)
         try:
             response.raise_for_status()
         except requests.exceptions.HTTPError as e:
@@ -254,7 +273,8 @@ class WhatsAppBot:
             }
         }
     
-        response = requests.post(url, headers=headers, json=data)
+        self.logger.debug(f"send_typing_indicator: {message_id}")
+        response = requests.post(url, headers=headers, json=data, timeout=REQUEST_TIMEOUT)
         try:
             response.raise_for_status()
         except requests.exceptions.HTTPError as e:
@@ -284,7 +304,8 @@ class WhatsAppBot:
         if message_id:
             data['context'] = { 'message_id': message_id }
 
-        response = requests.post(url, headers=headers, json=data)
+        self.logger.debug(f"_send_single_message: to={to_number}")
+        response = requests.post(url, headers=headers, json=data, timeout=REQUEST_TIMEOUT)
         try:
             response.raise_for_status()
         except requests.exceptions.HTTPError as e:
@@ -300,12 +321,14 @@ class WhatsAppBot:
         headers = {
             'Authorization': f'Bearer {self.api_token}'
         }
-        response = requests.get(url, headers=headers)
+        self.logger.debug(f"download_audio: fetching media URL for {media_id}")
+        response = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
         response.raise_for_status()
         media_url = response.json()['url']
 
         # Download the actual media file
-        response = requests.get(media_url, headers=headers)
+        self.logger.debug(f"download_audio: downloading media for {media_id}")
+        response = requests.get(media_url, headers=headers, timeout=DOWNLOAD_TIMEOUT)
         response.raise_for_status()
         
         # Create a temporary file with .ogg extension (WhatsApp voice messages are in OGG format)
@@ -318,7 +341,9 @@ class WhatsAppBot:
     def transcribe_audio(self, audio_path):
         """Transcribe audio using the ivrit package."""
         try:
+            self.logger.debug(f"transcribe_audio: starting transcription for {audio_path}")
             result = self.transcription_model.transcribe(path=audio_path, language='he')
+            self.logger.debug(f"transcribe_audio: completed for {audio_path}")
             text_result = '\n'.join(segment.text.strip() for segment in result['segments'])
             if text_result:
                 return text_result
@@ -331,7 +356,8 @@ class WhatsAppBot:
         """Get the duration of an audio file in seconds using ffprobe."""
         try:
             cmd = ['ffprobe', '-v', 'error', '-show_entries', 'format=duration', '-of', 'default=noprint_wrappers=1:nokey=1', audio_path]
-            result = subprocess.run(cmd, capture_output=True, text=True)
+            self.logger.debug(f"check_audio_duration: running ffprobe on {audio_path}")
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=SUBPROCESS_TIMEOUT)
             duration = float(result.stdout.strip())
             return duration
         except Exception as e:
@@ -364,12 +390,14 @@ class WhatsAppBot:
             headers = {
                 'Authorization': f'Bearer {self.api_token}'
             }
-            response = requests.get(url, headers=headers)
+            self.logger.debug(f"convert_document_to_mp3: fetching media URL for {document_id}")
+            response = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
             response.raise_for_status()
             media_url = response.json()['url']
 
             # Download the document
-            response = requests.get(media_url, headers=headers)
+            self.logger.debug(f"convert_document_to_mp3: downloading document for {document_id}")
+            response = requests.get(media_url, headers=headers, timeout=DOWNLOAD_TIMEOUT)
             response.raise_for_status()
             
             # Create temporary files
@@ -436,6 +464,43 @@ class WhatsAppBot:
             
             if full_buckets:
                 self.logger.info(f"Cleaned up {len(full_buckets)} full buckets")
+
+    def _set_activity(self, activity):
+        """Update current thread's activity for monitoring."""
+        thread_name = threading.current_thread().name
+        with self.activity_lock:
+            self.worker_activity[thread_name] = (activity, time.time())
+
+    def _monitor_threads(self):
+        """Periodically log thread activity to detect stuck workers."""
+        threading.current_thread().name = "Monitor"
+        self.logger.info("Monitor thread started")
+
+        while not self.stop_event.is_set():
+            self.stop_event.wait(MONITOR_INTERVAL)
+            if self.stop_event.is_set():
+                break
+
+            with self.activity_lock:
+                activities = dict(self.worker_activity)
+
+            now = time.time()
+            stuck_workers = []
+            status_lines = []
+
+            for worker, (activity, timestamp) in sorted(activities.items()):
+                age = now - timestamp
+                line = f"  {worker}: {activity} ({age:.0f}s ago)"
+                status_lines.append(line)
+                if age > STALLED_THRESHOLD:
+                    stuck_workers.append((worker, activity, age))
+
+            if status_lines:
+                self.logger.info("Thread status:\n" + "\n".join(status_lines))
+
+            if stuck_workers:
+                for worker, activity, age in stuck_workers:
+                    self.logger.warning(f"POSSIBLY STUCK: {worker} has been '{activity}' for {age:.0f}s")
 
     def handle_status_command(self, from_number, message_id):
         """Handle the /status command by returning bot statistics."""
@@ -578,10 +643,12 @@ class WhatsAppBot:
                 if message_type == 'audio':
                     # Process audio message
                     media_id = message_data['audio']['id']
+                    self._set_activity(f"downloading audio from {from_number}")
                     audio_path = self.download_audio(media_id)
                 elif message_type == 'document':
                     # Try to convert document to MP3
                     media_id = message_data['document']['id']
+                    self._set_activity(f"converting document from {from_number}")
                     audio_path = self.convert_document_to_mp3(media_id)
                     if audio_path:
                         message_type = 'audio'  # Update type for further processing
@@ -654,7 +721,8 @@ class WhatsAppBot:
                     # Record start time for transcription
                     self.send_typing_indicator(message_id)
                     transcription_start = datetime.now(timezone.utc)
-                    
+
+                    self._set_activity(f"transcribing audio from {from_number}")
                     response_text = self.process_audio_message(audio_path)
                     
                     # Calculate transcription time
@@ -685,8 +753,9 @@ class WhatsAppBot:
                     # We used to have an awesome speaking header silhouette.
                     # Removed so people can copy-and-paste the transcription easily.
                     #response_text = "\N{SPEAKING HEAD IN SILHOUETTE}\N{MEMO}: " + response_text
+                    self._set_activity(f"sending reply to {from_number}")
                     self.send_reply(from_number, message_id, response_text)
-                    
+
                     # Send donation nudge with probability 1/nudge_interval
                     self.send_periodic_donation_nudge(from_number)
                     
@@ -720,6 +789,7 @@ class WhatsAppBot:
         while not self.stop_event.is_set():
             try:
                 # Receive message from SQS
+                self._set_activity("polling SQS")
                 response = self.sqs.receive_message(
                     QueueUrl=self.queue_url,
                     MaxNumberOfMessages=1,
@@ -733,6 +803,7 @@ class WhatsAppBot:
                             message_body = json.loads(message['Body'])
                             
                             # Process the message
+                            self._set_activity("processing message")
                             if self.process_message(message_body):
                                 # Delete message from queue if processed successfully
                                 self.sqs.delete_message(
@@ -766,6 +837,15 @@ class WhatsAppBot:
             thread.start()
             self.logger.info(f"Started thread {thread.name}")
         
+        # Start monitor thread
+        monitor_thread = threading.Thread(
+            target=self._monitor_threads,
+            name="Monitor",
+            daemon=True
+        )
+        monitor_thread.start()
+        self.logger.info("Started monitor thread")
+
         try:
             # Keep the main thread alive
             while not self.stop_event.is_set():
@@ -788,6 +868,7 @@ if __name__ == "__main__":
     parser.add_argument('--user-max-messages-per-hour', type=float, default=10, help='Maximum messages per hour per user')
     parser.add_argument('--user-max-minutes-per-hour', type=float, default=20, help='Maximum audio minutes per hour per user')
     parser.add_argument('--cleanup-frequency', type=int, default=50, help='Perform bucket cleanup every N transcriptions')
+    parser.add_argument('--debug', action='store_true', help='Enable debug logging (verbose output to console and file)')
     args = parser.parse_args()
     
     # Initialize and run the bot
@@ -795,6 +876,7 @@ if __name__ == "__main__":
         nudge_interval=args.nudge_interval,
         user_max_messages_per_hour=args.user_max_messages_per_hour,
         user_max_minutes_per_hour=args.user_max_minutes_per_hour,
-        cleanup_frequency=args.cleanup_frequency
+        cleanup_frequency=args.cleanup_frequency,
+        debug=args.debug
     )
     bot.run() 
