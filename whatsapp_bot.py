@@ -160,12 +160,9 @@ class WhatsAppBot:
         self.worker_activity = {}
         self.activity_lock = threading.Lock()
 
-        # Debug mode
+        # Debug mode - verbose logging to file
         if debug:
             self.logger.setLevel(logging.DEBUG)
-            console_handler = logging.StreamHandler()
-            console_handler.setFormatter(FileLineFormatter())
-            self.logger.addHandler(console_handler)
 
     def is_allowed_region(self, phone_number):
         """Check if the phone number is from an allowed region (Israeli, American/Canadian, or European)."""
