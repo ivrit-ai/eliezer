@@ -431,7 +431,8 @@ class WhatsAppBot:
         self.logger.info(f"Sending donation nudge to {to_number}")
         donation_message = (
             "אליעזר, וכל פרויקט ivrit.ai, אינם למטרות רווח ומבוססים על תרומות מהציבור.\n"
-            "אם נהניתם מהשירות, נודה לתמיכה מכם, כאן: https://patreon.com/ivrit_ai\n\n"          
+            "אם נהניתם מהשירות, נודה לתמיכה מכם, כאן: https://patreon.com/ivrit_ai\n\n"
+            "אפשר לתרום גם בפייבוקס, כאן: https://links.payboxapp.com/QzVhOJJAzVb\n\n"
             "תודה רבה! 🙏🏻"
         )
         self.send_reply(to_number, None, donation_message)
