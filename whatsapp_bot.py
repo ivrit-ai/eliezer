@@ -1,5 +1,6 @@
 import os
 import json
+import asyncio
 import boto3
 import requests
 import tempfile
@@ -344,18 +345,25 @@ class WhatsAppBot:
         return temp_file.name
 
     def transcribe_audio(self, audio_path):
-        """Transcribe audio using the ivrit package."""
+        """Transcribe audio using the ivrit package (async path -> aiohttp)."""
         try:
             self.logger.debug(f"transcribe_audio: starting transcription for {audio_path}")
-            result = self.transcription_model.transcribe(path=audio_path, language='he')
-            self.logger.debug(f"transcribe_audio: completed for {audio_path}")
-            text_result = '\n'.join(segment.text.strip() for segment in result['segments'])
+            segments = asyncio.run(self._collect_transcription_segments(audio_path))
+            self.logger.debug(f"transcribe_audio: completed for {audio_path} ({len(segments)} segments)")
+            text_result = '\n'.join(segment.text.strip() for segment in segments)
             if text_result:
                 return text_result
             return "לא הצלחתי להבין את ההודעה הקולית."
         except Exception as e:
             self.logger.error(f"Error transcribing audio: {e}")
             return "אירעה שגיאה בעיבוד ההודעה הקולית."
+
+    async def _collect_transcription_segments(self, audio_path):
+        """Consume ivrit's async transcription generator into a list of segments."""
+        segments = []
+        async for segment in self.transcription_model.transcribe_async(path=audio_path, language='he'):
+            segments.append(segment)
+        return segments
 
     def check_audio_duration(self, audio_path):
         """Get the duration of an audio file in seconds using ffprobe."""
