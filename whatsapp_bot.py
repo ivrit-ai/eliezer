@@ -45,6 +45,13 @@ logger.addHandler(file_handler)
 # Prevent propagation to the root logger (which would output to console)
 logger.propagate = False
 
+# Forward ivrit-py logs into the same file (its module uses logging.getLogger('ivrit.audio')).
+# Without this, ivrit's records propagate to the unconfigured root logger and are dropped.
+ivrit_logger = logging.getLogger('ivrit')
+ivrit_logger.setLevel(logging.INFO)
+ivrit_logger.addHandler(file_handler)
+ivrit_logger.propagate = False
+
 ph = None
 if "POSTHOG_API_KEY" in os.environ:
     ph = posthog.Posthog(project_api_key=os.environ["POSTHOG_API_KEY"], host="https://us.i.posthog.com")
@@ -163,6 +170,7 @@ class WhatsAppBot:
         # Debug mode - verbose logging to file
         if debug:
             self.logger.setLevel(logging.DEBUG)
+            logging.getLogger('ivrit').setLevel(logging.DEBUG)
 
     def is_allowed_region(self, phone_number):
         """Check if the phone number is from an allowed region (Israeli, American/Canadian, or European)."""
