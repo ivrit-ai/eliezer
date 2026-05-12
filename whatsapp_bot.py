@@ -16,7 +16,6 @@ import posthog
 import uuid
 import random
 import argparse
-from pydub import AudioSegment
 import collections
 import statistics
 import phonenumbers
@@ -395,45 +394,57 @@ class WhatsAppBot:
             if os.path.exists(audio_path):
                 os.unlink(audio_path)
 
-    def convert_document_to_mp3(self, document_id):
-        """Convert a document to MP3 format."""
+    def convert_document_to_opus(self, document_id):
+        """Convert a document to Opus (CBR, mono) via ffmpeg."""
         try:
             # First, get the document URL
             url = f'{self.base_url}/{document_id}'
             headers = {
                 'Authorization': f'Bearer {self.api_token}'
             }
-            self.logger.debug(f"convert_document_to_mp3: fetching media URL for {document_id}")
+            self.logger.debug(f"convert_document_to_opus: fetching media URL for {document_id}")
             response = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
             response.raise_for_status()
             media_url = response.json()['url']
 
             # Download the document
-            self.logger.debug(f"convert_document_to_mp3: downloading document for {document_id}")
+            self.logger.debug(f"convert_document_to_opus: downloading document for {document_id}")
             response = requests.get(media_url, headers=headers, timeout=DOWNLOAD_TIMEOUT)
             response.raise_for_status()
-            
+
             # Create temporary files
             temp_input = tempfile.NamedTemporaryFile(delete=False)
-            temp_output = tempfile.NamedTemporaryFile(suffix='.mp3', delete=False)
-            
+            temp_output = tempfile.NamedTemporaryFile(suffix='.opus', delete=False)
+            temp_output.close()
+
             try:
                 # Save the downloaded document
                 temp_input.write(response.content)
                 temp_input.close()
-                
-                # Convert to MP3
-                audio = AudioSegment.from_file(temp_input.name)
-                audio.export(temp_output.name, format="mp3")
-                
+
+                # Convert with ffmpeg: opus codec, CBR (vbr off), mono
+                cmd = [
+                    'ffmpeg', '-y', '-loglevel', 'error',
+                    '-i', temp_input.name,
+                    '-c:a', 'libopus',
+                    '-b:a', '32k',
+                    '-vbr', 'off',
+                    '-ac', '1',
+                    temp_output.name,
+                ]
+                self.logger.debug(f"convert_document_to_opus: running ffmpeg on {temp_input.name}")
+                result = subprocess.run(cmd, capture_output=True, text=True)
+                if result.returncode != 0:
+                    raise RuntimeError(f"ffmpeg failed (rc={result.returncode}): {result.stderr.strip()}")
+
                 return temp_output.name
             finally:
                 # Clean up the input file
                 if os.path.exists(temp_input.name):
                     os.unlink(temp_input.name)
-                
+
         except Exception as e:
-            self.logger.error(f"Error converting document to MP3: {str(e)}")
+            self.logger.error(f"Error converting document to Opus: {str(e)}")
             # Clean up output file if it exists
             if 'temp_output' in locals() and os.path.exists(temp_output.name):
                 os.unlink(temp_output.name)
@@ -660,10 +671,10 @@ class WhatsAppBot:
                     self._set_activity(f"downloading audio from {from_number}")
                     audio_path = self.download_audio(media_id)
                 elif message_type == 'document':
-                    # Try to convert document to MP3
+                    # Try to convert document to Opus
                     media_id = message_data['document']['id']
                     self._set_activity(f"converting document from {from_number}")
-                    audio_path = self.convert_document_to_mp3(media_id)
+                    audio_path = self.convert_document_to_opus(media_id)
                     if audio_path:
                         message_type = 'audio'  # Update type for further processing
                 else:
