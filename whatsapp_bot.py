@@ -589,6 +589,17 @@ class WhatsAppBot:
                 avg_length = 0
                 median_length = 0
 
+        # Current estimated SQS backlog (visible, not-in-flight messages)
+        try:
+            attrs = self.sqs.get_queue_attributes(
+                QueueUrl=self.queue_url,
+                AttributeNames=['ApproximateNumberOfMessages'],
+            )
+            queue_depth = attrs['Attributes']['ApproximateNumberOfMessages']
+        except Exception as e:
+            self.logger.error(f"Error fetching SQS queue depth: {str(e)}")
+            queue_depth = "unknown"
+
         # Format uptime
         days, remainder = divmod(int(uptime_seconds), 86400)
         hours, remainder = divmod(remainder, 3600)
@@ -619,6 +630,7 @@ class WhatsAppBot:
             f"*Eliezer Status*\n\n"
             f"*Uptime:* {uptime_str}\n"
             f"*Messages handled:* {messages_handled}\n"
+            f"*Queue depth (est.):* {queue_depth}\n"
             f"*Total time transcribed:* {transcribed_str}\n\n"
             f"*Messages/min (1m):* {mpm_1m:.1f}\n"
             f"*Messages/min (5m):* {mpm_5m:.1f}\n"
@@ -850,13 +862,25 @@ class WhatsAppBot:
                     continue
 
                 self._set_activity("polling SQS")
-                response = self.sqs.receive_message(
-                    QueueUrl=self.queue_url,
-                    MaxNumberOfMessages=min(free, 10),  # SQS hard cap is 10
-                    WaitTimeSeconds=20
-                )
-                for message in response.get('Messages', []):
-                    self.job_queue.put(message)  # guaranteed room -> won't block
+                # Pull up to one job per worker thread this cycle. SQS caps a single
+                # ReceiveMessage at 10, so loop to reach the target: long-poll the
+                # first request, then short-poll the rest, stopping when drained.
+                target = min(free, self.num_worker_threads)
+                fetched = 0
+                wait = 20
+                while fetched < target and not self.stop_event.is_set():
+                    response = self.sqs.receive_message(
+                        QueueUrl=self.queue_url,
+                        MaxNumberOfMessages=min(target - fetched, 10),
+                        WaitTimeSeconds=wait
+                    )
+                    messages = response.get('Messages', [])
+                    if not messages:
+                        break
+                    for message in messages:
+                        self.job_queue.put(message)  # guaranteed room -> won't block
+                    fetched += len(messages)
+                    wait = 0
 
             except Exception as e:
                 self.logger.error(f"Error in dispatcher thread: {str(e)}")
