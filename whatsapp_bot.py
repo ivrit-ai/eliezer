@@ -143,11 +143,16 @@ class WhatsAppBot:
         # Thread control
         self.stop_event = threading.Event()
         self.worker_threads = []
+        # num_workers is the number of concurrent transcriptions. We run twice as
+        # many worker threads so I/O (SQS, media download, ffmpeg, reply) overlaps
+        # with transcription, and gate the transcription step itself with a semaphore.
         self.num_workers = num_workers
+        self.num_worker_threads = 2 * num_workers
+        self.transcription_semaphore = threading.BoundedSemaphore(num_workers)
         self.overflow_handler = overflow_handler
 
         # In-process queue: the dispatcher thread fills it from SQS, workers drain it.
-        self.job_queue = queue.Queue(maxsize=2 * num_workers)
+        self.job_queue = queue.Queue(maxsize=2 * self.num_worker_threads)
         
         # Logger
         self.logger = logging.getLogger('whatsapp_bot')
@@ -358,8 +363,10 @@ class WhatsAppBot:
     def transcribe_audio(self, audio_path):
         """Transcribe audio using the ivrit package (async path -> aiohttp)."""
         try:
-            self.logger.debug(f"transcribe_audio: starting transcription for {audio_path}")
-            segments = asyncio.run(self._collect_transcription_segments(audio_path))
+            self.logger.debug(f"transcribe_audio: waiting for transcription slot for {audio_path}")
+            with self.transcription_semaphore:
+                self.logger.debug(f"transcribe_audio: starting transcription for {audio_path}")
+                segments = asyncio.run(self._collect_transcription_segments(audio_path))
             self.logger.debug(f"transcribe_audio: completed for {audio_path} ({len(segments)} segments)")
             text_result = '\n'.join(segment.text.strip() for segment in segments)
             if text_result:
@@ -899,10 +906,11 @@ class WhatsAppBot:
         # Set main thread name
         threading.current_thread().name = "Main"
         
-        self.logger.info(f"Starting WhatsApp bot with {self.num_workers} workers...")
-        
+        self.logger.info(f"Starting WhatsApp bot with {self.num_worker_threads} worker threads "
+                         f"({self.num_workers} concurrent transcriptions)...")
+
         # Start worker threads
-        for i in range(self.num_workers):
+        for i in range(self.num_worker_threads):
             thread = threading.Thread(
                 target=self.worker,
                 args=(i,),
@@ -953,7 +961,7 @@ if __name__ == "__main__":
     parser.add_argument('--user-max-messages-per-hour', type=float, default=10, help='Maximum messages per hour per user')
     parser.add_argument('--user-max-minutes-per-hour', type=float, default=20, help='Maximum audio minutes per hour per user')
     parser.add_argument('--cleanup-frequency', type=int, default=50, help='Perform bucket cleanup every N transcriptions')
-    parser.add_argument('--num-workers', type=int, default=None, help='Number of worker threads (default: 10, or 1 in --local mode)')
+    parser.add_argument('--num-workers', type=int, default=None, help='Number of concurrent transcriptions (default: 10, or 1 in --local mode); the bot runs 2x this many worker threads to overlap I/O')
     parser.add_argument('--local', action='store_true', help='Transcribe locally with faster-whisper instead of RunPod')
     parser.add_argument('--overflow-handler', type=int, default=None, metavar='N', help='Only handle jobs when the SQS queue depth exceeds N')
     parser.add_argument('--debug', action='store_true', help='Enable debug logging (verbose output to console and file)')
