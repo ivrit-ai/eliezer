@@ -11,6 +11,7 @@ import subprocess
 import logging
 from datetime import datetime, timezone
 import threading
+import queue
 import time
 import posthog
 import uuid
@@ -73,6 +74,7 @@ DOWNLOAD_TIMEOUT = (10, 120)  # longer for media downloads
 SUBPROCESS_TIMEOUT = 30
 MONITOR_INTERVAL = 60  # seconds between thread status reports
 STALLED_THRESHOLD = 120  # seconds before a thread is flagged as possibly stuck
+IDLE_PROBE_INTERVAL = 10  # seconds the dispatcher waits when there is nothing to pull
 
 class LeakyBucket:
     def __init__(self, max_messages_per_hour, max_minutes_per_hour):
@@ -115,27 +117,37 @@ class LeakyBucket:
                 self.seconds_remaining >= self.max_minutes * 0.95)
 
 class WhatsAppBot:
-    def __init__(self, nudge_interval, user_max_messages_per_hour, user_max_minutes_per_hour, cleanup_frequency, debug=False):
+    def __init__(self, nudge_interval, user_max_messages_per_hour, user_max_minutes_per_hour, cleanup_frequency, num_workers, local=False, overflow_handler=None, debug=False):
         self.sqs = boto3.client('sqs')
         self.queue_url = os.getenv('APP_SQS_QUEUE')
         self.api_token = os.getenv('WHATSAPP_API_TOKEN')
         self.phone_number_id = os.getenv('WHATSAPP_PHONE_NUMBER_ID')
         self.api_version = 'v22.0'
         self.base_url = f'https://graph.facebook.com/{self.api_version}'
-        
+
         # Initialize transcription model
-        self.transcription_model = ivrit.load_model(
-            engine='runpod',
-            model='ivrit-ai/whisper-large-v3-turbo-ct2',
-            api_key=os.getenv('RUNPOD_API_KEY'),
-            endpoint_id=os.getenv('RUNPOD_ENDPOINT_ID'),
-            core_engine='faster-whisper',
-        )
-        
+        if local:
+            self.transcription_model = ivrit.load_model(
+                engine='faster-whisper',
+                model='ivrit-ai/whisper-large-v3-turbo-ct2',
+            )
+        else:
+            self.transcription_model = ivrit.load_model(
+                engine='runpod',
+                model='ivrit-ai/whisper-large-v3-turbo-ct2',
+                api_key=os.getenv('RUNPOD_API_KEY'),
+                endpoint_id=os.getenv('RUNPOD_ENDPOINT_ID'),
+                core_engine='faster-whisper',
+            )
+
         # Thread control
         self.stop_event = threading.Event()
         self.worker_threads = []
-        self.num_workers = 10
+        self.num_workers = num_workers
+        self.overflow_handler = overflow_handler
+
+        # In-process queue: the dispatcher thread fills it from SQS, workers drain it.
+        self.job_queue = queue.Queue(maxsize=2 * num_workers)
         
         # Logger
         self.logger = logging.getLogger('whatsapp_bot')
@@ -803,41 +815,80 @@ class WhatsAppBot:
             self.logger.error(f"Error processing message: {str(e)}")
             return False
 
-    def worker(self, worker_id):
-        """Worker thread function to poll SQS and process messages."""
-        thread_name = f"Worker-{worker_id}"
-        # Set thread name
-        threading.current_thread().name = thread_name
-        
-        self.logger.info("Starting worker thread")
-        
+    def dispatcher(self):
+        """Single thread that reads SQS and feeds jobs to the worker pool."""
+        threading.current_thread().name = "Dispatcher"
+        self.logger.info("Dispatcher thread started")
+
         while not self.stop_event.is_set():
             try:
-                # Receive message from SQS
+                free = self.job_queue.maxsize - self.job_queue.qsize()
+
+                # Overflow mode: only take messages above the threshold.
+                if self.overflow_handler is not None:
+                    self._set_activity("probing queue depth")
+                    attrs = self.sqs.get_queue_attributes(
+                        QueueUrl=self.queue_url,
+                        AttributeNames=['ApproximateNumberOfMessages'],
+                    )
+                    pending = int(attrs['Attributes']['ApproximateNumberOfMessages'])
+                    free = min(free, pending - self.overflow_handler)
+                    self.logger.debug(
+                        f"Queue depth {pending}, overflow threshold "
+                        f"{self.overflow_handler}, can pull {free}")
+
+                if free < 1:
+                    # No room locally, or at/below the overflow threshold.
+                    self.stop_event.wait(IDLE_PROBE_INTERVAL)
+                    continue
+
                 self._set_activity("polling SQS")
                 response = self.sqs.receive_message(
                     QueueUrl=self.queue_url,
-                    MaxNumberOfMessages=1,
+                    MaxNumberOfMessages=min(free, 10),  # SQS hard cap is 10
                     WaitTimeSeconds=20
                 )
+                for message in response.get('Messages', []):
+                    self.job_queue.put(message)  # guaranteed room -> won't block
 
-                if 'Messages' in response:
-                    for message in response['Messages']:
-                        try:
-                            # Parse message body
-                            message_body = json.loads(message['Body'])
-                            
-                            # Process the message
-                            self._set_activity("processing message")
-                            if self.process_message(message_body):
-                                # Delete message from queue if processed successfully
-                                self.sqs.delete_message(
-                                    QueueUrl=self.queue_url,
-                                    ReceiptHandle=message['ReceiptHandle']
-                                )
-                        except Exception as e:                                
-                            self.logger.error(f"Error processing message: {str(e)}")
-                
+            except Exception as e:
+                self.logger.error(f"Error in dispatcher thread: {str(e)}")
+                time.sleep(5)  # Wait a bit before retrying
+                continue
+
+    def worker(self, worker_id):
+        """Worker thread function to process jobs handed off by the dispatcher."""
+        thread_name = f"Worker-{worker_id}"
+        # Set thread name
+        threading.current_thread().name = thread_name
+
+        self.logger.info("Starting worker thread")
+
+        while not self.stop_event.is_set():
+            try:
+                self._set_activity("waiting for job")
+                try:
+                    message = self.job_queue.get(timeout=1)
+                except queue.Empty:
+                    continue
+
+                try:
+                    # Parse message body
+                    message_body = json.loads(message['Body'])
+
+                    # Process the message
+                    self._set_activity("processing message")
+                    if self.process_message(message_body):
+                        # Delete message from queue if processed successfully
+                        self.sqs.delete_message(
+                            QueueUrl=self.queue_url,
+                            ReceiptHandle=message['ReceiptHandle']
+                        )
+                except Exception as e:
+                    self.logger.error(f"Error processing message: {str(e)}")
+                finally:
+                    self.job_queue.task_done()
+
             except Exception as e:
                 self.logger.error(f"Error in worker thread: {str(e)}")
                 time.sleep(5)  # Wait a bit before retrying
@@ -862,6 +913,15 @@ class WhatsAppBot:
             thread.start()
             self.logger.info(f"Started thread {thread.name}")
         
+        # Start dispatcher thread (sole SQS reader, feeds the worker pool)
+        dispatcher_thread = threading.Thread(
+            target=self.dispatcher,
+            name="Dispatcher",
+            daemon=True
+        )
+        dispatcher_thread.start()
+        self.logger.info("Started dispatcher thread")
+
         # Start monitor thread
         monitor_thread = threading.Thread(
             target=self._monitor_threads,
@@ -893,15 +953,26 @@ if __name__ == "__main__":
     parser.add_argument('--user-max-messages-per-hour', type=float, default=10, help='Maximum messages per hour per user')
     parser.add_argument('--user-max-minutes-per-hour', type=float, default=20, help='Maximum audio minutes per hour per user')
     parser.add_argument('--cleanup-frequency', type=int, default=50, help='Perform bucket cleanup every N transcriptions')
+    parser.add_argument('--num-workers', type=int, default=None, help='Number of worker threads (default: 10, or 1 in --local mode)')
+    parser.add_argument('--local', action='store_true', help='Transcribe locally with faster-whisper instead of RunPod')
+    parser.add_argument('--overflow-handler', type=int, default=None, metavar='N', help='Only handle jobs when the SQS queue depth exceeds N')
     parser.add_argument('--debug', action='store_true', help='Enable debug logging (verbose output to console and file)')
     args = parser.parse_args()
-    
+
+    # Resolve worker count: explicit value wins, else 1 locally / 10 remotely.
+    num_workers = args.num_workers
+    if num_workers is None:
+        num_workers = 1 if args.local else 10
+
     # Initialize and run the bot
     bot = WhatsAppBot(
         nudge_interval=args.nudge_interval,
         user_max_messages_per_hour=args.user_max_messages_per_hour,
         user_max_minutes_per_hour=args.user_max_minutes_per_hour,
         cleanup_frequency=args.cleanup_frequency,
+        num_workers=num_workers,
+        local=args.local,
+        overflow_handler=args.overflow_handler,
         debug=args.debug
     )
-    bot.run() 
+    bot.run()
