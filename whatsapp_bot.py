@@ -747,23 +747,23 @@ class WhatsAppBot:
         if stats is not None:
             totals = stats.get('totals') or {}
             td = int(totals.get('duration_seconds', 0) or 0)
+            qd = stats.get('queue_depth')
+            qd_str = "unknown" if qd is None else str(qd)
             lines.append(
                 f"\n*Fleet totals:* {int(totals.get('messages', 0))} msgs, "
                 f"{int(totals.get('transcriptions', 0))} transcriptions, "
                 f"{td // 3600}h {(td % 3600) // 60}m transcribed")
+            lines.append(f"*Queue depth (shared):* {qd_str}")
 
             instances = sorted(stats.get('instances') or [], key=lambda i: i.get('instance_id', ''))
             for inst in instances:
                 iid = inst.get('instance_id', '?')
                 marker = " (me)" if iid == self.instance_id else ""
-                up = int(inst.get('uptime_seconds', 0) or 0)
-                age = inst.get('age_seconds', 0)
-                qd = inst.get('queue_depth')
-                qd_str = "n/a" if qd is None else str(qd)
+                up = int(float(inst.get('uptime_seconds', 0) or 0))
+                age = float(inst.get('age_seconds', 0) or 0)
                 lines.append(
                     f"\n*{iid}*{marker} — live ({int(age)}s ago)\n"
-                    f"  Uptime: {up // 3600}h {(up % 3600) // 60}m\n"
-                    f"  Queue depth: {qd_str}")
+                    f"  Uptime: {up // 3600}h {(up % 3600) // 60}m")
 
             if not instances:
                 lines.append("\n_No live instances reporting._")

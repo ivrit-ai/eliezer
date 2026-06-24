@@ -18,12 +18,15 @@ STALE_SECONDS = int(os.environ.get("STALE_SECONDS", "90"))
 # Events older than this are pruned; long enough to cover the 24h window with margin.
 EVENT_RETENTION_SECONDS = 25 * 3600
 
-# In-process per-minute message-count cache, so /api/stats can serve the 24h graph
+# In-process per-minute message-count cache, so /api/stats can serve the 1h graph
 # without re-aggregating the events table on every poll. Keyed by minute-bucket epoch
 # (int seconds, floored to the minute) -> {instance_id: count}. The single site process
 # is the sole writer for all instances' ingests, so this stays consistent across the
 # fleet. waitress is multithreaded, so every access is guarded by _series_lock.
-SERIES_MINUTES = 24 * 60  # graph window: 1440 one-minute buckets
+SERIES_MINUTES = 60  # 1h graph: 60 one-minute buckets, kept in-process
+# The weekly graph needs hourly buckets going back further than events are retained, so
+# those are persisted in the msg_hourly table (see init_db) and queried per poll (168 rows).
+WEEK_HOURS = 7 * 24  # 1-week graph: 168 one-hour buckets
 
 _series_lock = threading.Lock()
 _series_counts = defaultdict(lambda: defaultdict(int))
@@ -46,9 +49,10 @@ def _ensure_series_loaded(cur):
                extract(epoch FROM date_trunc('minute', ts))::bigint AS m,
                count(*) AS cnt
         FROM events
-        WHERE kind = 'message' AND ts > now() - interval '24 hours'
+        WHERE kind = 'message' AND ts > now() - make_interval(mins => %s)
         GROUP BY instance_id, date_trunc('minute', ts);
-        """
+        """,
+        (SERIES_MINUTES,),
     )
     for row in cur.fetchall():
         _series_counts[int(row["m"])][row["instance_id"]] = int(row["cnt"])
@@ -103,6 +107,18 @@ def init_db():
             );
             """
         )
+        # Persistent per-hour message counts for the weekly graph (events are pruned at
+        # 25h, so a week of history must live in its own aggregate, surviving restarts).
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS msg_hourly (
+              hour TIMESTAMPTZ NOT NULL,
+              instance_id TEXT NOT NULL,
+              cnt BIGINT NOT NULL DEFAULT 0,
+              PRIMARY KEY (hour, instance_id)
+            );
+            """
+        )
         conn.commit()
 
 
@@ -112,6 +128,7 @@ def reset_db():
     with connect() as conn, conn.cursor() as cur:
         cur.execute("DELETE FROM events;")
         cur.execute("DELETE FROM instances;")
+        cur.execute("DELETE FROM msg_hourly;")
         cur.execute("UPDATE totals SET messages = 0, transcriptions = 0, duration_seconds = 0 WHERE id = 1;")
         conn.commit()
 
@@ -149,6 +166,7 @@ def ingest():
     transcriptions_delta = 0
     duration_delta = 0.0
     message_minutes = []
+    hour_counts = defaultdict(int)
 
     with connect() as conn, conn.cursor() as cur:
         for ev in events:
@@ -167,9 +185,21 @@ def ingest():
             if kind == "message":
                 messages_delta += 1
                 message_minutes.append(_minute_epoch(ts))
+                hour_counts[ts.replace(minute=0, second=0, microsecond=0)] += 1
             else:
                 transcriptions_delta += 1
                 duration_delta += float(duration or 0)
+
+        for hour_dt, cnt in hour_counts.items():
+            cur.execute(
+                """
+                INSERT INTO msg_hourly (hour, instance_id, cnt)
+                VALUES (%s, %s, %s)
+                ON CONFLICT (hour, instance_id) DO UPDATE
+                  SET cnt = msg_hourly.cnt + EXCLUDED.cnt;
+                """,
+                (hour_dt, instance_id, cnt),
+            )
 
         if messages_delta or transcriptions_delta or duration_delta:
             cur.execute(
@@ -195,12 +225,13 @@ def ingest():
             (instance_id, uptime_seconds, queue_depth),
         )
 
-        # Opportunistic prune so events don't grow without bound.
+        # Opportunistic prune so events / hourly buckets don't grow without bound.
         if random.random() < 0.02:
             cur.execute(
                 "DELETE FROM events WHERE ts < now() - make_interval(secs => %s);",
                 (EVENT_RETENTION_SECONDS,),
             )
+            cur.execute("DELETE FROM msg_hourly WHERE hour < now() - interval '8 days';")
 
         conn.commit()
 
@@ -266,7 +297,7 @@ def stats():
         )
         instances = cur.fetchall()
 
-        # Per-minute message counts over the last 24h, served from the in-process cache
+        # Per-minute message counts over the last hour, served from the in-process cache
         # (zero-filled for a continuous x-axis). The cache is backfilled from the DB once
         # on cold start and kept current by ingest, so no aggregation runs per poll.
         with _series_lock:
@@ -274,18 +305,45 @@ def stats():
             now_epoch = int(time.time()) // 60 * 60
             _prune_series(now_epoch)
             minutes = [now_epoch - (SERIES_MINUTES - 1 - i) * 60 for i in range(SERIES_MINUTES)]
-            series = [
+            minute_series = [
                 {"t": m, "count": sum(_series_counts.get(m, {}).values())}
                 for m in minutes
             ]
-            host_ids = sorted({iid for c in _series_counts.values() for iid in c})
-            series_by_instance = [
+            minute_host_ids = sorted({iid for c in _series_counts.values() for iid in c})
+            minute_by_instance = [
                 {
                     "instance_id": iid,
                     "counts": [_series_counts.get(m, {}).get(iid, 0) for m in minutes],
                 }
-                for iid in host_ids
+                for iid in minute_host_ids
             ]
+
+        # Per-hour message counts over the last week, from the persistent msg_hourly
+        # aggregate (zero-filled to 168 buckets).
+        cur.execute(
+            """
+            SELECT instance_id, extract(epoch FROM hour)::bigint AS h, cnt
+            FROM msg_hourly
+            WHERE hour > now() - make_interval(hours => %s)
+            ORDER BY hour;
+            """,
+            (WEEK_HOURS,),
+        )
+        hour_rows = cur.fetchall()
+
+    now_hour = int(time.time()) // 3600 * 3600
+    hours = [now_hour - (WEEK_HOURS - 1 - i) * 3600 for i in range(WEEK_HOURS)]
+    per_host_hour = defaultdict(dict)
+    for row in hour_rows:
+        per_host_hour[row["instance_id"]][int(row["h"])] = int(row["cnt"])
+    week_series = [
+        {"t": h, "count": sum(hc.get(h, 0) for hc in per_host_hour.values())}
+        for h in hours
+    ]
+    week_by_instance = [
+        {"instance_id": iid, "counts": [per_host_hour[iid].get(h, 0) for h in hours]}
+        for iid in sorted(per_host_hour)
+    ]
 
     latest_queue_depth = None
     for inst in instances:
@@ -319,14 +377,15 @@ def stats():
                 {
                     "instance_id": i["instance_id"],
                     "uptime_seconds": i["uptime_seconds"],
-                    "queue_depth": i["queue_depth"],
-                    "age_seconds": round(i["age_seconds"], 1),
+                    "age_seconds": round(float(i["age_seconds"]), 1),
                 }
                 for i in instances
             ],
             "live_instances": len(instances),
-            "messages_series": series,
-            "messages_series_by_instance": series_by_instance,
+            "messages_series_1h": minute_series,
+            "messages_series_1h_by_instance": minute_by_instance,
+            "messages_series_1w": week_series,
+            "messages_series_1w_by_instance": week_by_instance,
             "generated_at": time.time(),
         }
     )

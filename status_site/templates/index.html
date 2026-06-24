@@ -45,13 +45,13 @@
     .chart-head { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 0.75rem; }
     .chart-head .label { color: #6b7280; font-size: 0.78rem; text-transform: uppercase; letter-spacing: 0.04em; }
     .chart-head .peak { color: #9aa0a8; font-size: 0.8rem; }
-    #chart { width: 100%; height: 160px; display: block; }
-    #chart .axis { stroke: #eceef1; stroke-width: 1; }
-    #chart .axis-label { fill: #9aa0a8; font-size: 10px; }
-    #legend { display: flex; flex-wrap: wrap; gap: 0.4rem 1rem; margin-top: 0.75rem; }
-    #legend .item { display: flex; align-items: center; gap: 0.4rem; font-size: 0.8rem; color: #4b5563; }
-    #legend .swatch { width: 12px; height: 3px; border-radius: 2px; display: inline-block; }
-    #legend .item.all .swatch { height: 4px; }
+    .chart-card svg { width: 100%; height: 160px; display: block; }
+    .chart-card svg .axis { stroke: #eceef1; stroke-width: 1; }
+    .chart-card svg .axis-label { fill: #9aa0a8; font-size: 10px; }
+    .legend { display: flex; flex-wrap: wrap; gap: 0.4rem 1rem; margin-top: 0.75rem; }
+    .legend .item { display: flex; align-items: center; gap: 0.4rem; font-size: 0.8rem; color: #4b5563; }
+    .legend .swatch { width: 12px; height: 3px; border-radius: 2px; display: inline-block; }
+    .legend .item.all .swatch { height: 4px; }
   </style>
 </head>
 <body>
@@ -62,10 +62,10 @@
 
   <div class="chart-card">
     <div class="chart-head">
-      <span class="label">Messages per minute &mdash; last 24h</span>
-      <span class="peak" id="chart-peak"></span>
+      <span class="label">Messages per minute &mdash; last hour</span>
+      <span class="peak" id="peak-1h"></span>
     </div>
-    <svg id="chart" viewBox="0 0 600 160" preserveAspectRatio="none" role="img" aria-label="Messages per minute, last 24 hours">
+    <svg id="chart-1h" viewBox="0 0 600 160" preserveAspectRatio="none" role="img" aria-label="Messages per minute, last hour">
       <defs>
         <linearGradient id="area-fill" x1="0" y1="0" x2="0" y2="1">
           <stop offset="0%" stop-color="#2563eb" stop-opacity="0.28"/>
@@ -73,13 +73,22 @@
         </linearGradient>
       </defs>
     </svg>
-    <div id="legend"></div>
+    <div id="legend-1h" class="legend"></div>
+  </div>
+
+  <div class="chart-card">
+    <div class="chart-head">
+      <span class="label">Messages per hour &mdash; last 7 days</span>
+      <span class="peak" id="peak-1w"></span>
+    </div>
+    <svg id="chart-1w" viewBox="0 0 600 160" preserveAspectRatio="none" role="img" aria-label="Messages per hour, last 7 days"></svg>
+    <div id="legend-1w" class="legend"></div>
   </div>
 
   <h2>Live instances</h2>
   <table>
     <thead>
-      <tr><th>Instance</th><th>Uptime</th><th>Queue depth</th><th>Last seen</th></tr>
+      <tr><th>Instance</th><th>Uptime</th><th>Last seen</th></tr>
     </thead>
     <tbody id="instances"></tbody>
   </table>
@@ -116,9 +125,9 @@
       if (dash) el.setAttribute("stroke-dasharray", dash);
       svg.appendChild(el);
     }
-    function renderChart(series, byInstance) {
-      const svg = document.getElementById("chart");
-      const legend = document.getElementById("legend");
+    function renderChart(chartId, legendId, peakId, series, byInstance, leftLabel, unit) {
+      const svg = document.getElementById(chartId);
+      const legend = document.getElementById(legendId);
       // Clear everything except the <defs> gradient.
       [...svg.querySelectorAll(":scope > *:not(defs)")].forEach(n => n.remove());
       legend.innerHTML = "";
@@ -150,8 +159,8 @@
         svg.appendChild(lbl);
       });
 
-      // x labels: -24h on the left, now on the right.
-      [["-24h", padL, "start"], ["now", W - padR, "end"]].forEach(([t, xx, anchor]) => {
+      // x labels: window start on the left, now on the right.
+      [[leftLabel, padL, "start"], ["now", W - padR, "end"]].forEach(([t, xx, anchor]) => {
         const lbl = document.createElementNS(SVGNS, "text");
         lbl.setAttribute("class", "axis-label");
         lbl.setAttribute("x", xx); lbl.setAttribute("y", H - 5);
@@ -181,7 +190,7 @@
         `<span class="item ${cls}"><span class="swatch" style="background:${color}"></span>${name}</span>`
       ).join("");
 
-      document.getElementById("chart-peak").textContent = `peak ${maxY}/min`;
+      document.getElementById(peakId).textContent = `peak ${maxY}/${unit}`;
     }
     async function refresh() {
       try {
@@ -193,6 +202,7 @@
           card("Total transcriptions", fmtNum(t.transcriptions)),
           card("Total audio", fmtDuration(t.duration_seconds)),
           card("Unique users (24h)", fmtNum(d.unique_users_24h)),
+          card("Messages / min (last 1m)", fmtNum(m.last_1m)),
           card("Messages / min (1h)", fmtNum(m.per_min_1h)),
           card("Messages (last 5m)", fmtNum(m.last_5m)),
           card("Median transcription (1h)", tr.median_duration != null ? fmtDuration(tr.median_duration) : "–"),
@@ -202,16 +212,18 @@
         ].join("");
         document.getElementById("cards").innerHTML = cards;
 
-        renderChart(d.messages_series, d.messages_series_by_instance);
+        renderChart("chart-1h", "legend-1h", "peak-1h",
+          d.messages_series_1h, d.messages_series_1h_by_instance, "-1h", "min");
+        renderChart("chart-1w", "legend-1w", "peak-1w",
+          d.messages_series_1w, d.messages_series_1w_by_instance, "-7d", "hr");
 
         const rows = (d.instances || []).map(i =>
           `<tr><td><span class="dot"></span>${i.instance_id}</td>` +
           `<td>${fmtDuration(i.uptime_seconds)}</td>` +
-          `<td>${i.queue_depth == null ? "–" : fmtNum(i.queue_depth)}</td>` +
           `<td class="muted">${i.age_seconds}s ago</td></tr>`
         ).join("");
         document.getElementById("instances").innerHTML =
-          rows || `<tr><td colspan="4" class="muted">No live instances.</td></tr>`;
+          rows || `<tr><td colspan="3" class="muted">No live instances.</td></tr>`;
 
         document.getElementById("updated").textContent =
           "Updated " + new Date().toLocaleTimeString();
