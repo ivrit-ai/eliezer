@@ -1,3 +1,4 @@
+import base64
 import os
 import random
 import threading
@@ -7,7 +8,33 @@ from datetime import datetime, timezone
 
 import psycopg
 from psycopg.rows import dict_row
-from flask import Flask, jsonify, render_template, request
+from flask import Flask, Response, jsonify, render_template, request
+
+# 32x32 ivrit.ai favicon (PNG), embedded so it can be served without a binary asset.
+FAVICON_PNG = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAEyUlEQVR42q2WzWsTXRTGfzOTJmnzoVBo"
+    "SlVKoXZnuzBQrBUEQbpRuhDq0n/Bf8CtC9e6dFXElQoKL7qwFUUQJVFcuDCUtEVs0khjSm2TmXufd6EZ"
+    "GtukNnogZDhz5pznfNznHgAkub/+X+mnBGojxhgdJEEQ7GfX9Pnfr1gegMsBYowB4NGjR+TzeVzXJQiC"
+    "fW0eP37M/fv38TwP13VD/YHSrgLWWllrZYzRyMiI+vv79fr16zDL36syMTEhQNeuXdPy8vLvFdu3Ah0B"
+    "NIPcvXtXrusKUCKR0KtXr0LnTZv5+XkBisViApTJZLSwsLAbRHctAHjz5g3WWuLxOFtbW8zNzVGtVnEc"
+    "B0lIolwuk0qlqNfrRKNRSqUSs7OzfP36FcdxOrejUwuMMdre3talS5daMrxz544kyfd9WWslSYVCQdls"
+    "tsVufn5ektRoNA7fgiYISarVahoeHpbrunIcRzMzMy2z4Pu+JGlpaUmJREKe58lxnBBoOwAHtsBxHHzf"
+    "J5VKcf36day1SOLdu3d8//4dz/OQRCQSIQgCRkZGyGazGGOQRCwW6+j/j2agGeTKlSv09fUBUKlUyOVy"
+    "AFhrQ7CSSKfT4bdHjhz5ewCu6yKJY8eOcebMmVC/uLjYbGEIwHEcGo1GaDMwMBC+6xpAM0tJXLx4MdS9"
+    "ePEiBLhbdnZ2AIhGowwNDf0bAM3szp07F+ry+TyVSgXXdbHWhkA2NzcByGQy/w5A0/mpU6cYHBwEoFar"
+    "8fbt25Y58H2fWq0GwOjoKL29vS3g/qoCxhiSySTZbDbUP3/+vGUOqtUqGxsbAJw+fboF3F8B2B3k/Pnz"
+    "ewaxmWGpVKJarQJw9uzZjuU/NIBmkMuXL9PT04PjOHz8+JFisYjn/SS2paUljDGk0+nwxLQrf1cAjDGc"
+    "PHmSq1evIol6vc7i4iLWWowxvH//HsdxmJ6eJpPJYK3tWAG6WUiMMSoWi0omkwI0NzcXvp+enhage/fu"
+    "nVB0V9fx7g3H9335vh8+S9KDBw8Ui8WUyWS0urqq27dvy/M8DQ8Pa2trK9wn/grALgctUqlUlM/nNTk5"
+    "Kdd11d/fL0CAHj58uGdpaQcg8ifH7+XLlxQKBVZWVvj8+TOFQoFisUipVArtvn37xvHjx7l58yazs7NY"
+    "a8PB7GolC4JA1lrlcrkws3a/iYkJ3bp1S+vr650W18NXwHEcbty4sUefTqcZHx/nwoULzMzMMDk5GU66"
+    "MebPM28HIAgCIpEIz54948mTJwwNDTE2NkY2m2VqaopsNsuJEyf2fON53qGCtwXQJI7BwUHy+Tyjo6Mk"
+    "k8k9rGiMwXEcXNclEonQjXQEMD4+3nId7w7oOM6ebJtUvXs5OYiKI4dhwU6Uul+gAxmwE4B6vc7Tp09"
+    "Jp9PE43FisRjWWlKpFNZa1tfX6evrY3t7G9d1mZqaYmFhAUnE4/HwGo5Go4yNjbXdDdum1Gg0MMZw9OhR"
+    "EokEpVKJXC5HsVgM9761tTU2Nzfp7e3ly5cvrK6u0tPTw8DAAOVymQ8fPvDp0ycikUjHK3lfHmhyviTV"
+    "63UtLy+rUqmo0WiEB3ttbU0bGxv68eOHqtWqarVayAMrKysql8va2dlp6v4tFXch3VPx75vvflP/J/b7"
+    "yf/Gfn489swlzwAAAABJRU5ErkJggg=="
+)
 
 app = Flask(__name__)
 
@@ -389,6 +416,11 @@ def stats():
             "generated_at": time.time(),
         }
     )
+
+
+@app.get("/favicon.ico")
+def favicon():
+    return Response(FAVICON_PNG, mimetype="image/png")
 
 
 @app.get("/")

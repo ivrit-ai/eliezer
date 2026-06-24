@@ -4,6 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Eliezer Status</title>
+  <link rel="icon" type="image/png" href="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAEyUlEQVR42q2WzWsTXRTGfzOTJmnzoVBoSlVKoXZnuzBQrBUEQbpRuhDq0n/Bf8CtC9e6dFXElQoKL7qwFUUQJVFcuDCUtEVs0khjSm2TmXufd6EZGtukNnogZDhz5pznfNznHgAkub/+X+mnBGojxhgdJEEQ7GfX9Pnfr1gegMsBYowB4NGjR+TzeVzXJQiCfW0eP37M/fv38TwP13VD/YHSrgLWWllrZYzRyMiI+vv79fr16zDL36syMTEhQNeuXdPy8vLvFdu3Ah0BNIPcvXtXrusKUCKR0KtXr0LnTZv5+XkBisViApTJZLSwsLAbRHctAHjz5g3WWuLxOFtbW8zNzVGtVnEcB0lIolwuk0qlqNfrRKNRSqUSs7OzfP36FcdxOrejUwuMMdre3talS5daMrxz544kyfd9WWslSYVCQdlstsVufn5ektRoNA7fgiYISarVahoeHpbrunIcRzMzMy2z4Pu+JGlpaUmJREKe58lxnBBoOwAHtsBxHHzfJ5VKcf36day1SOLdu3d8//4dz/OQRCQSIQgCRkZGyGazGGOQRCwW6+j/j2agGeTKlSv09fUBUKlUyOVyAFhrQ7CSSKfT4bdHjhz5ewCu6yKJY8eOcebMmVC/uLjYbGEIwHEcGo1GaDMwMBC+6xpAM0tJXLx4MdS9ePEiBLhbdnZ2AIhGowwNDf0bAM3szp07F+ry+TyVSgXXdbHWhkA2NzcByGQy/w5A0/mpU6cYHBwEoFar8fbt25Y58H2fWq0GwOjoKL29vS3g/qoCxhiSySTZbDbUP3/+vGUOqtUqGxsbAJw+fboF3F8B2B3k/PnzewaxmWGpVKJarQJw9uzZjuU/NIBmkMuXL9PT04PjOHz8+JFisYjn/SS2paUljDGk0+nwxLQrf1cAjDGcPHmSq1evIol6vc7i4iLWWowxvH//HsdxmJ6eJpPJYK3tWAG6WUiMMSoWi0omkwI0NzcXvp+enhage/funVB0V9fx7g3H9335vh8+S9KDBw8Ui8WUyWS0urqq27dvy/M8DQ8Pa2trK9wn/grALgctUqlUlM/nNTk5Kdd11d/fL0CAHj58uGdpaQcg8ifH7+XLlxQKBVZWVvj8+TOFQoFisUipVArtvn37xvHjx7l58yazs7NYa8PB7GolC4JA1lrlcrkws3a/iYkJ3bp1S+vr650W18NXwHEcbty4sUefTqcZHx/nwoULzMzMMDk5GU66MebPM28HIAgCIpEIz54948mTJwwNDTE2NkY2m2VqaopsNsuJEyf2fON53qGCtwXQJI7BwUHy+Tyjo6Mkk8k9rGiMwXEcXNclEonQjXQEMD4+3nId7w7oOM6ebJtUvXs5OYiKI4dhwU6Uul+gAxmwE4B6vc7Tp09Jp9PE43FisRjWWlKpFNZa1tfX6evrY3t7G9d1mZqaYmFhAUnE4/HwGo5Go4yNjbXdDdum1Gg0MMZw9OhREokEpVKJXC5HsVgM9761tTU2Nzfp7e3ly5cvrK6u0tPTw8DAAOVymQ8fPvDp0ycikUjHK3lfHmhyviTV63UtLy+rUqmo0WiEB3ttbU0bGxv68eOHqtWqarVayAMrKysql8va2dlp6v4tFXch3VPx75vvflP/J/b7yf/Gfn489swlzwAAAABJRU5ErkJggg==">
   <style>
     :root { color-scheme: light; }
     * { box-sizing: border-box; }
@@ -36,7 +37,8 @@
     th { color: #6b7280; font-weight: 500; background: #fafbfc; }
     .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: #16a34a; margin-right: 0.5rem; }
     .muted { color: #9aa0a8; }
-    footer { margin-top: 2rem; color: #9aa0a8; font-size: 0.8rem; }
+    footer { margin-top: 4rem; color: #9aa0a8; font-size: 0.8rem; text-align: center; }
+    footer a { color: #6b7280; }
     .chart-card {
       background: #ffffff; border: 1px solid #e3e6ea; border-radius: 12px;
       padding: 1.1rem 1.25rem; margin-bottom: 2rem;
@@ -93,7 +95,7 @@
     <tbody id="instances"></tbody>
   </table>
 
-  <footer>Auto-refreshing every 5s.</footer>
+  <footer>Auto-refreshing every 5s. &middot; Developed with <a href="https://xhostd.com">xhostd.com</a>.</footer>
 
   <script>
     function fmtDuration(s) {
