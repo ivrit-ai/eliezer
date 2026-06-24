@@ -12,6 +12,7 @@ import logging
 from datetime import datetime, timezone
 import threading
 import queue
+import socket
 import time
 import posthog
 import uuid
@@ -21,6 +22,7 @@ import collections
 import statistics
 import phonenumbers
 from phonenumbers import region_code_for_number, country_code_for_region
+from status_reporter import StatusReporter
 
 # Load environment variables
 load_dotenv()
@@ -170,7 +172,18 @@ class WhatsAppBot:
         self.messages_handled = 0
         self.message_timestamps = collections.deque()  # timestamps of all incoming messages
         self.message_lengths = collections.deque()  # (timestamp, audio_duration) for transcribed messages
-        
+
+        # Fleet-wide stats via the Eliezer Status site (opt-in). When STATUS_SITE_URL is set,
+        # each instance POSTs lightweight per-event metadata to the site, which aggregates the
+        # whole fleet in SQL and renders a live dashboard. Unset -> the reporter is a no-op and
+        # /status reports this instance only (the local windowed view below).
+        self.instance_id = os.getenv('INSTANCE_ID') or socket.gethostname()
+        self.status_reporter = StatusReporter(
+            self.instance_id,
+            self.stop_event,
+            queue_depth_fn=self._queue_depth,
+        )
+
         # Leaky bucket rate limiter settings
         self.user_max_messages_per_hour = user_max_messages_per_hour
         self.user_max_minutes_per_hour = user_max_minutes_per_hour
@@ -546,14 +559,13 @@ class WhatsAppBot:
                 for worker, activity, age in stuck_workers:
                     self.logger.warning(f"POSSIBLY STUCK: {worker} has been '{activity}' for {age:.0f}s")
 
-    def handle_status_command(self, from_number, message_id):
-        """Handle the /status command by returning bot statistics."""
-        now = time.time()
+    def _compute_snapshot(self, now):
+        """Snapshot this instance's stats (cumulative totals + windowed counts).
 
+        Shared shape between the anon-kv flush payload and the local /status view.
+        Acquires counter_lock and prunes the >24h deque tails as a side effect.
+        """
         with self.counter_lock:
-            uptime_seconds = now - self.start_time
-            messages_handled = self.messages_handled
-
             # Prune entries older than 24 hours
             one_day_ago = now - 86400
             while self.message_timestamps and self.message_timestamps[0] < one_day_ago:
@@ -561,86 +573,215 @@ class WhatsAppBot:
             while self.message_lengths and self.message_lengths[0][0] < one_day_ago:
                 self.message_lengths.popleft()
 
-            # Messages per minute over different windows
             timestamps = list(self.message_timestamps)
             one_minute_ago = now - 60
             five_minutes_ago = now - 300
             one_hour_ago = now - 3600
 
-            msgs_last_minute = sum(1 for t in timestamps if t >= one_minute_ago)
-            msgs_last_5_minutes = sum(1 for t in timestamps if t >= five_minutes_ago)
-            msgs_last_hour = sum(1 for t in timestamps if t >= one_hour_ago)
-            msgs_last_day = len(timestamps)
-
-            mpm_1m = float(msgs_last_minute)
-            mpm_5m = msgs_last_5_minutes / 5.0
-            mpm_1h = msgs_last_hour / 60.0
-            mpm_24h = msgs_last_day / 1440.0
-
-            # Total time transcribed
-            total_duration = self.total_duration
-
-            # Message lengths (audio durations) over last hour
             lengths = [duration for ts, duration in self.message_lengths if ts >= one_hour_ago]
-            if lengths:
-                avg_length = sum(lengths) / len(lengths)
-                median_length = statistics.median(lengths)
-            else:
-                avg_length = 0
-                median_length = 0
+            return {
+                "ts": now,
+                "uptime": now - self.start_time,
+                "c_messages": self.messages_handled,
+                "c_transcriptions": self.transcription_counter,
+                "c_duration": self.total_duration,
+                "msgs_1m": sum(1 for t in timestamps if t >= one_minute_ago),
+                "msgs_5m": sum(1 for t in timestamps if t >= five_minutes_ago),
+                "msgs_1h": sum(1 for t in timestamps if t >= one_hour_ago),
+                "msgs_24h": len(timestamps),
+                "len_sum_1h": sum(lengths),
+                "len_count_1h": len(lengths),
+                "len_median_1h": statistics.median(lengths) if lengths else 0.0,
+            }
 
-        # Current estimated SQS backlog (visible, not-in-flight messages)
+    def _queue_depth(self):
+        """Current estimated SQS backlog (visible, not-in-flight messages) as an int,
+        or None if it can't be fetched. Used by /status and the status reporter heartbeat."""
         try:
             attrs = self.sqs.get_queue_attributes(
                 QueueUrl=self.queue_url,
                 AttributeNames=['ApproximateNumberOfMessages'],
             )
-            queue_depth = attrs['Attributes']['ApproximateNumberOfMessages']
+            return int(attrs['Attributes']['ApproximateNumberOfMessages'])
         except Exception as e:
             self.logger.error(f"Error fetching SQS queue depth: {str(e)}")
+            return None
+
+    def _local_view(self, snap):
+        """Single-instance /status view derived from a local snapshot."""
+        count = snap['len_count_1h']
+        return {
+            "messages_handled": snap['c_messages'],
+            "total_duration": snap['c_duration'],
+            "uptime_seconds": snap['uptime'],
+            "mpm_1m": float(snap['msgs_1m']),
+            "mpm_5m": snap['msgs_5m'] / 5.0,
+            "mpm_1h": snap['msgs_1h'] / 60.0,
+            "mpm_24h": snap['msgs_24h'] / 1440.0,
+            "avg_length": (snap['len_sum_1h'] / count) if count else 0,
+            "median_length": snap['len_median_1h'],
+            "live_instances": None,
+        }
+
+    @staticmethod
+    def _fmt_uptime(seconds):
+        """Compact uptime, e.g. '2d 3h 5m 10s'."""
+        days, remainder = divmod(int(seconds), 86400)
+        hours, remainder = divmod(remainder, 3600)
+        minutes, secs = divmod(remainder, 60)
+        parts = []
+        if days > 0:
+            parts.append(f"{days}d")
+        if hours > 0:
+            parts.append(f"{hours}h")
+        if minutes > 0:
+            parts.append(f"{minutes}m")
+        parts.append(f"{secs}s")
+        return " ".join(parts)
+
+    @staticmethod
+    def _fmt_transcribed(seconds):
+        """Longform transcribed time, e.g. '1 days, 2 hours, 30 minutes'."""
+        td_days, rem = divmod(int(seconds), 86400)
+        td_hours, rem = divmod(rem, 3600)
+        td_minutes, _ = divmod(rem, 60)
+        parts = []
+        if td_days > 0:
+            parts.append(f"{td_days} days")
+        parts.append(f"{td_hours} hours")
+        parts.append(f"{td_minutes} minutes")
+        return ", ".join(parts)
+
+    def _fetch_site_stats(self):
+        """GET the aggregated fleet stats from the status site. Returns the parsed dict,
+        or None if the site is unreachable / returns an error (caller falls back to local)."""
+        try:
+            resp = requests.get(
+                f"{self.status_reporter.site_url}/api/stats",
+                timeout=REQUEST_TIMEOUT,
+            )
+            resp.raise_for_status()
+            return resp.json()
+        except Exception as e:
+            self.logger.debug(f"Status site /api/stats fetch failed: {str(e)}")
+            return None
+
+    def _site_view(self, stats):
+        """Map the site's /api/stats JSON onto the /status view shape used below."""
+        totals = stats.get('totals') or {}
+        msgs = stats.get('messages') or {}
+        tr = stats.get('transcriptions_1h') or {}
+        uptimes = [i.get('uptime_seconds', 0) for i in (stats.get('instances') or [])]
+        return {
+            "messages_handled": totals.get('messages', 0),
+            "total_duration": totals.get('duration_seconds', 0) or 0,
+            "uptime_seconds": max(uptimes) if uptimes else 0,
+            "mpm_1m": float(msgs.get('last_1m', 0)),
+            "mpm_5m": (msgs.get('last_5m', 0) or 0) / 5.0,
+            "mpm_1h": msgs.get('per_min_1h', 0) or 0,
+            "mpm_24h": (msgs.get('last_24h', 0) or 0) / 1440.0,
+            "avg_length": tr.get('avg_duration') or 0,
+            "median_length": tr.get('median_duration') or 0,
+            "live_instances": stats.get('live_instances'),
+            "unique_users_24h": stats.get('unique_users_24h'),
+        }
+
+    def handle_status_command(self, from_number, message_id):
+        """Handle the /status command by returning bot statistics.
+
+        When the status site is configured (STATUS_SITE_URL set), report fleet-wide numbers
+        fetched from the site and append the dashboard link. Otherwise (or if the fetch
+        fails) report this single instance from the local windowed view.
+        """
+        now = time.time()
+
+        stats = self._fetch_site_stats() if self.status_reporter.enabled else None
+        if stats is not None:
+            view = self._site_view(stats)
+        else:
+            view = self._local_view(self._compute_snapshot(now))
+
+        queue_depth = self._queue_depth()
+        if queue_depth is None:
             queue_depth = "unknown"
 
-        # Format uptime
-        days, remainder = divmod(int(uptime_seconds), 86400)
-        hours, remainder = divmod(remainder, 3600)
-        minutes, seconds = divmod(remainder, 60)
+        uptime_str = self._fmt_uptime(view['uptime_seconds'])
+        transcribed_str = self._fmt_transcribed(view['total_duration'])
 
-        uptime_parts = []
-        if days > 0:
-            uptime_parts.append(f"{days}d")
-        if hours > 0:
-            uptime_parts.append(f"{hours}h")
-        if minutes > 0:
-            uptime_parts.append(f"{minutes}m")
-        uptime_parts.append(f"{seconds}s")
-        uptime_str = " ".join(uptime_parts)
-
-        # Format total time transcribed
-        td_days, td_remainder = divmod(int(total_duration), 86400)
-        td_hours, td_remainder = divmod(td_remainder, 3600)
-        td_minutes, _ = divmod(td_remainder, 60)
-        transcribed_parts = []
-        if td_days > 0:
-            transcribed_parts.append(f"{td_days} days")
-        transcribed_parts.append(f"{td_hours} hours")
-        transcribed_parts.append(f"{td_minutes} minutes")
-        transcribed_str = ", ".join(transcribed_parts)
+        instances_line = ""
+        if view.get('live_instances') is not None:
+            instances_line = f"*Live instances:* {view['live_instances']}\n"
+        users_line = ""
+        if view.get('unique_users_24h') is not None:
+            users_line = f"*Unique users (24h):* {view['unique_users_24h']}\n"
 
         status_text = (
             f"*Eliezer Status*\n\n"
             f"*Uptime:* {uptime_str}\n"
-            f"*Messages handled:* {messages_handled}\n"
+            f"{instances_line}"
+            f"{users_line}"
+            f"*Messages handled:* {view['messages_handled']}\n"
             f"*Queue depth (est.):* {queue_depth}\n"
             f"*Total time transcribed:* {transcribed_str}\n\n"
-            f"*Messages/min (1m):* {mpm_1m:.1f}\n"
-            f"*Messages/min (5m):* {mpm_5m:.1f}\n"
-            f"*Messages/min (1h):* {mpm_1h:.2f}\n"
-            f"*Messages/min (24h):* {mpm_24h:.2f}\n\n"
-            f"*Avg message length (1h):* {avg_length:.1f}s\n"
-            f"*Median message length (1h):* {median_length:.1f}s"
+            f"*Messages/min (1m):* {view['mpm_1m']:.1f}\n"
+            f"*Messages/min (5m):* {view['mpm_5m']:.1f}\n"
+            f"*Messages/min (1h):* {view['mpm_1h']:.2f}\n"
+            f"*Messages/min (24h):* {view['mpm_24h']:.2f}\n\n"
+            f"*Avg message length (1h):* {view['avg_length']:.1f}s\n"
+            f"*Median message length (1h):* {view['median_length']:.1f}s"
         )
 
+        if self.status_reporter.enabled:
+            status_text += f"\n\n📊 {self.status_reporter.site_url}"
+
         self.send_reply(from_number, message_id, status_text)
+
+    def handle_detailed_status_command(self, from_number, message_id):
+        """Report each host separately. When the status site is configured, list every live
+        instance from /api/stats (no merge); otherwise show this host alone from local stats."""
+        now = time.time()
+
+        stats = self._fetch_site_stats() if self.status_reporter.enabled else None
+        lines = ["*Eliezer Detailed Status*"]
+
+        if stats is not None:
+            totals = stats.get('totals') or {}
+            td = int(totals.get('duration_seconds', 0) or 0)
+            lines.append(
+                f"\n*Fleet totals:* {int(totals.get('messages', 0))} msgs, "
+                f"{int(totals.get('transcriptions', 0))} transcriptions, "
+                f"{td // 3600}h {(td % 3600) // 60}m transcribed")
+
+            instances = sorted(stats.get('instances') or [], key=lambda i: i.get('instance_id', ''))
+            for inst in instances:
+                iid = inst.get('instance_id', '?')
+                marker = " (me)" if iid == self.instance_id else ""
+                up = int(inst.get('uptime_seconds', 0) or 0)
+                age = inst.get('age_seconds', 0)
+                qd = inst.get('queue_depth')
+                qd_str = "n/a" if qd is None else str(qd)
+                lines.append(
+                    f"\n*{iid}*{marker} — live ({int(age)}s ago)\n"
+                    f"  Uptime: {up // 3600}h {(up % 3600) // 60}m\n"
+                    f"  Queue depth: {qd_str}")
+
+            if not instances:
+                lines.append("\n_No live instances reporting._")
+
+            lines.append(f"\n📊 {self.status_reporter.site_url}")
+        else:
+            snap = self._compute_snapshot(now)
+            view = self._local_view(snap)
+            up = int(view['uptime_seconds'])
+            lines.append(
+                f"\n*{self.instance_id}* (me)\n"
+                f"  Uptime: {up // 3600}h {(up % 3600) // 60}m\n"
+                f"  Messages handled: {view['messages_handled']}\n"
+                f"  Msgs/min: {view['mpm_1m']:.1f} (1m) · {view['mpm_5m']:.1f} (5m) · "
+                f"{view['mpm_1h']:.2f} (1h) · {view['mpm_24h']:.2f} (24h)\n"
+                f"  Length (1h): avg {view['avg_length']:.1f}s · median {view['median_length']:.1f}s")
+
+        self.send_reply(from_number, message_id, "\n".join(lines))
 
     def process_message(self, message):
         """Process a single WhatsApp message."""
@@ -684,6 +825,10 @@ class WhatsAppBot:
             with self.counter_lock:
                 self.messages_handled += 1
                 self.message_timestamps.append(time.time())
+            self.status_reporter.record_message(
+                message_data.get('type'),
+                self.status_reporter.user_hash(from_number),
+            )
 
             # Handle different message types
             message_type = message_data.get('type')
@@ -713,6 +858,9 @@ class WhatsAppBot:
                     text_body = message_data.get('text', {}).get('body', '').strip()
                     if text_body == '/status':
                         self.handle_status_command(from_number, message_id)
+                        return True
+                    if text_body == '/detailed-status':
+                        self.handle_detailed_status_command(from_number, message_id)
                         return True
                     self.logger.info(f"Ignoring non-voice message of type: {message_type} from {from_number}")
                     self.send_reply(from_number, message_id, "נכון להיום אני יודע לתמלל הקלטות, לא מעבר לזה.")
@@ -794,6 +942,9 @@ class WhatsAppBot:
                         self.message_lengths.append((time.time(), duration))
                         current_count = self.transcription_counter
                         total_duration_minutes = self.total_duration / 60
+                    self.status_reporter.record_transcription(
+                        duration, 'audio', self.status_reporter.user_hash(from_number),
+                    )
 
                     # Capture transcription event
                     transcription_props = {
@@ -962,6 +1113,17 @@ class WhatsAppBot:
         )
         monitor_thread.start()
         self.logger.info("Started monitor thread")
+
+        # Start status reporter thread (POSTs per-event metadata to the Eliezer Status site).
+        # No-op when STATUS_SITE_URL is unset.
+        if self.status_reporter.enabled:
+            reporter_thread = threading.Thread(
+                target=self.status_reporter.run,
+                name="StatusReporter",
+                daemon=True
+            )
+            reporter_thread.start()
+            self.logger.info(f"Started status reporter thread (instance_id={self.instance_id})")
 
         try:
             # Keep the main thread alive

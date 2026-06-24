@@ -1,0 +1,226 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Eliezer Status</title>
+  <style>
+    :root { color-scheme: light; }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0; padding: 2rem;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: #f5f6f8; color: #1c1f24;
+    }
+    h1 { font-weight: 600; margin: 0 0 0.25rem; }
+    .sub { color: #6b7280; margin-bottom: 2rem; font-size: 0.9rem; }
+    .grid {
+      display: grid; gap: 1rem;
+      grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+      margin-bottom: 2rem;
+    }
+    .card {
+      background: #ffffff; border: 1px solid #e3e6ea; border-radius: 12px;
+      padding: 1.1rem 1.25rem; box-shadow: 0 1px 2px rgba(16, 24, 40, 0.05);
+    }
+    .card .label { color: #6b7280; font-size: 0.78rem; text-transform: uppercase; letter-spacing: 0.04em; }
+    .card .value { font-size: 1.8rem; font-weight: 600; margin-top: 0.35rem; }
+    .card .unit { font-size: 0.85rem; color: #6b7280; font-weight: 400; }
+    h2 { font-weight: 600; font-size: 1.05rem; margin: 0 0 0.75rem; }
+    table {
+      width: 100%; border-collapse: collapse; font-size: 0.9rem;
+      background: #ffffff; border: 1px solid #e3e6ea; border-radius: 12px; overflow: hidden;
+    }
+    th, td { text-align: left; padding: 0.5rem 0.75rem; border-bottom: 1px solid #eceef1; }
+    tr:last-child td { border-bottom: none; }
+    th { color: #6b7280; font-weight: 500; background: #fafbfc; }
+    .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: #16a34a; margin-right: 0.5rem; }
+    .muted { color: #9aa0a8; }
+    footer { margin-top: 2rem; color: #9aa0a8; font-size: 0.8rem; }
+    .chart-card {
+      background: #ffffff; border: 1px solid #e3e6ea; border-radius: 12px;
+      padding: 1.1rem 1.25rem; margin-bottom: 2rem;
+      box-shadow: 0 1px 2px rgba(16, 24, 40, 0.05);
+    }
+    .chart-head { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 0.75rem; }
+    .chart-head .label { color: #6b7280; font-size: 0.78rem; text-transform: uppercase; letter-spacing: 0.04em; }
+    .chart-head .peak { color: #9aa0a8; font-size: 0.8rem; }
+    #chart { width: 100%; height: 160px; display: block; }
+    #chart .axis { stroke: #eceef1; stroke-width: 1; }
+    #chart .axis-label { fill: #9aa0a8; font-size: 10px; }
+    #legend { display: flex; flex-wrap: wrap; gap: 0.4rem 1rem; margin-top: 0.75rem; }
+    #legend .item { display: flex; align-items: center; gap: 0.4rem; font-size: 0.8rem; color: #4b5563; }
+    #legend .swatch { width: 12px; height: 3px; border-radius: 2px; display: inline-block; }
+    #legend .item.all .swatch { height: 4px; }
+  </style>
+</head>
+<body>
+  <h1>Eliezer Status</h1>
+  <div class="sub" id="updated">Loading…</div>
+
+  <div class="grid" id="cards"></div>
+
+  <div class="chart-card">
+    <div class="chart-head">
+      <span class="label">Messages per minute &mdash; last 24h</span>
+      <span class="peak" id="chart-peak"></span>
+    </div>
+    <svg id="chart" viewBox="0 0 600 160" preserveAspectRatio="none" role="img" aria-label="Messages per minute, last 24 hours">
+      <defs>
+        <linearGradient id="area-fill" x1="0" y1="0" x2="0" y2="1">
+          <stop offset="0%" stop-color="#2563eb" stop-opacity="0.28"/>
+          <stop offset="100%" stop-color="#2563eb" stop-opacity="0.02"/>
+        </linearGradient>
+      </defs>
+    </svg>
+    <div id="legend"></div>
+  </div>
+
+  <h2>Live instances</h2>
+  <table>
+    <thead>
+      <tr><th>Instance</th><th>Uptime</th><th>Queue depth</th><th>Last seen</th></tr>
+    </thead>
+    <tbody id="instances"></tbody>
+  </table>
+
+  <footer>Auto-refreshing every 5s.</footer>
+
+  <script>
+    function fmtDuration(s) {
+      if (s == null) return "–";
+      s = Math.round(s);
+      const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), sec = s % 60;
+      if (h) return `${h}h ${m}m`;
+      if (m) return `${m}m ${sec}s`;
+      return `${sec}s`;
+    }
+    function fmtNum(n) {
+      if (n == null) return "–";
+      return Number(n).toLocaleString();
+    }
+    function card(label, value, unit) {
+      return `<div class="card"><div class="label">${label}</div>` +
+        `<div class="value">${value}<span class="unit">${unit ? " " + unit : ""}</span></div></div>`;
+    }
+    const SVGNS = "http://www.w3.org/2000/svg";
+    const HOST_COLORS = ["#2563eb", "#dc2626", "#16a34a", "#d97706", "#7c3aed", "#0891b2", "#db2777", "#65a30d"];
+    function polyline(svg, pts, color, width, dash) {
+      const el = document.createElementNS(SVGNS, "polyline");
+      el.setAttribute("points", pts);
+      el.setAttribute("fill", "none");
+      el.setAttribute("stroke", color);
+      el.setAttribute("stroke-width", width);
+      el.setAttribute("stroke-linejoin", "round");
+      el.setAttribute("stroke-linecap", "round");
+      if (dash) el.setAttribute("stroke-dasharray", dash);
+      svg.appendChild(el);
+    }
+    function renderChart(series, byInstance) {
+      const svg = document.getElementById("chart");
+      const legend = document.getElementById("legend");
+      // Clear everything except the <defs> gradient.
+      [...svg.querySelectorAll(":scope > *:not(defs)")].forEach(n => n.remove());
+      legend.innerHTML = "";
+      if (!series || !series.length) return;
+
+      byInstance = byInstance || [];
+      const W = 600, H = 160, padL = 28, padR = 6, padT = 8, padB = 18;
+      const innerW = W - padL - padR, innerH = H - padT - padB;
+      const aggCounts = series.map(p => p.count);
+      const hostMax = byInstance.reduce((mx, h) => Math.max(mx, ...h.counts), 0);
+      const maxY = Math.max(1, ...aggCounts, hostMax);
+      const n = series.length;
+      const x = i => padL + (n === 1 ? innerW / 2 : (i / (n - 1)) * innerW);
+      const y = v => padT + innerH - (v / maxY) * innerH;
+      const ptsFor = counts => counts.map((c, i) => `${x(i).toFixed(1)},${y(c).toFixed(1)}`).join(" ");
+
+      // Horizontal gridlines + y labels at 0 and max.
+      [0, maxY].forEach(v => {
+        const yy = y(v);
+        const line = document.createElementNS(SVGNS, "line");
+        line.setAttribute("class", "axis");
+        line.setAttribute("x1", padL); line.setAttribute("x2", W - padR);
+        line.setAttribute("y1", yy); line.setAttribute("y2", yy);
+        svg.appendChild(line);
+        const lbl = document.createElementNS(SVGNS, "text");
+        lbl.setAttribute("class", "axis-label");
+        lbl.setAttribute("x", 2); lbl.setAttribute("y", yy + 3);
+        lbl.textContent = v;
+        svg.appendChild(lbl);
+      });
+
+      // x labels: -24h on the left, now on the right.
+      [["-24h", padL, "start"], ["now", W - padR, "end"]].forEach(([t, xx, anchor]) => {
+        const lbl = document.createElementNS(SVGNS, "text");
+        lbl.setAttribute("class", "axis-label");
+        lbl.setAttribute("x", xx); lbl.setAttribute("y", H - 5);
+        lbl.setAttribute("text-anchor", anchor);
+        lbl.textContent = t;
+        svg.appendChild(lbl);
+      });
+
+      // Area fill under the aggregate line.
+      const aggPts = ptsFor(aggCounts);
+      const area = document.createElementNS(SVGNS, "polygon");
+      area.setAttribute("points", `${padL},${y(0).toFixed(1)} ${aggPts} ${(W - padR)},${y(0).toFixed(1)}`);
+      area.setAttribute("fill", "url(#area-fill)");
+      svg.appendChild(area);
+
+      // Per-host lines (colored), then the aggregate on top (bold dark).
+      byInstance.forEach((h, idx) => {
+        polyline(svg, ptsFor(h.counts), HOST_COLORS[idx % HOST_COLORS.length], "1.5");
+      });
+      polyline(svg, aggPts, "#1c1f24", "2.25");
+
+      // Legend.
+      const items = [["All hosts", "#1c1f24", "all"]];
+      byInstance.forEach((h, idx) =>
+        items.push([h.instance_id, HOST_COLORS[idx % HOST_COLORS.length], ""]));
+      legend.innerHTML = items.map(([name, color, cls]) =>
+        `<span class="item ${cls}"><span class="swatch" style="background:${color}"></span>${name}</span>`
+      ).join("");
+
+      document.getElementById("chart-peak").textContent = `peak ${maxY}/min`;
+    }
+    async function refresh() {
+      try {
+        const r = await fetch("/api/stats", { cache: "no-store" });
+        const d = await r.json();
+        const t = d.totals, m = d.messages, tr = d.transcriptions_1h;
+        const cards = [
+          card("Total messages", fmtNum(t.messages)),
+          card("Total transcriptions", fmtNum(t.transcriptions)),
+          card("Total audio", fmtDuration(t.duration_seconds)),
+          card("Unique users (24h)", fmtNum(d.unique_users_24h)),
+          card("Messages / min (1h)", fmtNum(m.per_min_1h)),
+          card("Messages (last 5m)", fmtNum(m.last_5m)),
+          card("Median transcription (1h)", tr.median_duration != null ? fmtDuration(tr.median_duration) : "–"),
+          card("p95 transcription (1h)", tr.p95_duration != null ? fmtDuration(tr.p95_duration) : "–"),
+          card("Queue depth", fmtNum(d.queue_depth)),
+          card("Live instances", fmtNum(d.live_instances)),
+        ].join("");
+        document.getElementById("cards").innerHTML = cards;
+
+        renderChart(d.messages_series, d.messages_series_by_instance);
+
+        const rows = (d.instances || []).map(i =>
+          `<tr><td><span class="dot"></span>${i.instance_id}</td>` +
+          `<td>${fmtDuration(i.uptime_seconds)}</td>` +
+          `<td>${i.queue_depth == null ? "–" : fmtNum(i.queue_depth)}</td>` +
+          `<td class="muted">${i.age_seconds}s ago</td></tr>`
+        ).join("");
+        document.getElementById("instances").innerHTML =
+          rows || `<tr><td colspan="4" class="muted">No live instances.</td></tr>`;
+
+        document.getElementById("updated").textContent =
+          "Updated " + new Date().toLocaleTimeString();
+      } catch (e) {
+        document.getElementById("updated").textContent = "Failed to load stats.";
+      }
+    }
+    refresh();
+    setInterval(refresh, 5000);
+  </script>
+</body>
+</html>
