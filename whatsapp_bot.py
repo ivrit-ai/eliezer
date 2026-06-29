@@ -68,6 +68,8 @@ def capture_event(distinct_id, event, props=None):
     props = {} if not props else props
     props["source"] = "eliezer.ivrit.ai"
 
+    props["instance_id"] = os.getenv("INSTANCE_ID") or "unknown"
+
     ph.capture(distinct_id=distinct_id, event=event, properties=props)
 
 # Timeouts for HTTP requests: (connect_timeout, read_timeout) in seconds
