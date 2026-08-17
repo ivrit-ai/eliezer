@@ -189,8 +189,11 @@ class WhatsAppBot:
         # Logger
         self.logger = logging.getLogger('whatsapp_bot')
         
-        # Nudge interval for donation messages
+        # Nudge interval for periodic messages
         self.nudge_interval = nudge_interval
+        nudge_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'nudge.txt')
+        with open(nudge_path, encoding='utf-8') as f:
+            self.nudge_message = f.read().strip()
         
         # Transcription counter and duration tracker
         self.transcription_counter = 0
@@ -512,19 +515,13 @@ class WhatsAppBot:
                 os.unlink(temp_output.name)
             return None
 
-    def send_periodic_donation_nudge(self, to_number):
-        """Send a donation nudge message to the user with probability 1/nudge_interval."""
+    def send_periodic_nudge(self, to_number):
+        """Send the nudge message to the user with probability 1/nudge_interval."""
         if random.random() >= (1.0 / self.nudge_interval):
             return
-        
-        self.logger.info(f"Sending donation nudge to {to_number}")
-        donation_message = (
-            "אליעזר, וכל פרויקט ivrit.ai, אינם למטרות רווח ומבוססים על תרומות מהציבור.\n"
-            "אם נהניתם מהשירות, נודה לתמיכה מכם, כאן: https://patreon.com/ivrit_ai\n\n"
-            "אפשר לתרום גם בפייבוקס, כאן: https://links.payboxapp.com/QzVhOJJAzVb\n\n"
-            "תודה רבה! 🙏🏻"
-        )
-        self.send_reply(to_number, None, donation_message)
+
+        self.logger.info(f"Sending nudge to {to_number}")
+        self.send_reply(to_number, None, self.nudge_message)
 
     def get_user_bucket(self, user_id):
         """Get or create a user's leaky bucket."""
@@ -993,8 +990,8 @@ class WhatsAppBot:
                     self._set_activity(f"sending reply to {from_number}")
                     self.send_reply(from_number, message_id, response_text)
 
-                    # Send donation nudge with probability 1/nudge_interval
-                    self.send_periodic_donation_nudge(from_number)
+                    # Send nudge with probability 1/nudge_interval
+                    self.send_periodic_nudge(from_number)
                     
                     # Perform deterministic cleanup after sending all messages
                     if self.transcription_counter % self.cleanup_frequency == 0:
@@ -1173,7 +1170,7 @@ class WhatsAppBot:
 if __name__ == "__main__":
     # Parse command line arguments
     parser = argparse.ArgumentParser(description='WhatsApp Bot for audio transcription')
-    parser.add_argument('--nudge-interval', type=int, default=100, help='Interval for donation nudges (1:N probability)')
+    parser.add_argument('--nudge-interval', type=int, default=100, help='Interval for nudge messages (1:N probability)')
     parser.add_argument('--user-max-messages-per-hour', type=float, default=10, help='Maximum messages per hour per user')
     parser.add_argument('--user-max-minutes-per-hour', type=float, default=20, help='Maximum audio minutes per hour per user')
     parser.add_argument('--cleanup-frequency', type=int, default=50, help='Perform bucket cleanup every N transcriptions')
