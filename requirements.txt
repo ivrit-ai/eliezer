@@ -4,3 +4,4 @@ requests
 ivrit==0.2.5
 posthog
 phonenumbers
+gradio_client>=1.0,<2

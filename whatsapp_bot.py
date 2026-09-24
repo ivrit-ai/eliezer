@@ -25,6 +25,7 @@ import statistics
 import phonenumbers
 from phonenumbers import region_code_for_number, country_code_for_region
 from status_reporter import StatusReporter
+import text_utils
 
 # Load environment variables
 load_dotenv()
@@ -107,6 +108,69 @@ SUBPROCESS_TIMEOUT = 30
 MONITOR_INTERVAL = 60  # seconds between thread status reports
 STALLED_THRESHOLD = 120  # seconds before a thread is flagged as possibly stuck
 IDLE_PROBE_INTERVAL = 10  # seconds the dispatcher waits when there is nothing to pull
+
+# ---------------------------------------------------------------------------
+# Text-to-speech: send pacing/retry and user-facing copy.
+# ---------------------------------------------------------------------------
+# The language gate and the long-text chunker live in text_utils (import-light + unit-testable).
+
+# Seconds between the several voice-note sends of one long message, so rapid replies don't
+# burst the WhatsApp API into throttling. Each send also gets a small bounded retry below.
+TTS_SEND_GAP = float(os.getenv('TTS_SEND_GAP', '0.35'))
+TTS_SEND_RETRIES = int(os.getenv('TTS_SEND_RETRIES', '3'))
+
+
+def _is_transient_http_error(exc):
+    """True if exc is a transient send failure worth retrying: a timeout, a dropped
+    connection, or an HTTP 429/5xx. A 4xx (bad request / auth) is permanent -- never retried."""
+    if isinstance(exc, (requests.exceptions.Timeout, requests.exceptions.ConnectionError)):
+        return True
+    if isinstance(exc, requests.exceptions.HTTPError):
+        resp = getattr(exc, "response", None)
+        if resp is not None:
+            return resp.status_code == 429 or resp.status_code >= 500
+    return False
+
+
+# --- User-facing copy (Hebrew). OPERATOR-TUNABLE: this is the exact wording the bot sends
+# on the text-to-speech path. Adapted for Eliezer (no BlueTTS branding); edit freely. ---
+
+# Sent ONCE, the first time a user asks for a voice note.
+TTS_WELCOME = (
+    "ברוכים הבאים לבוט ההקראה! 🎧\n"
+    "שלחו לי טקסט בעברית או באנגלית, ואחזיר לכם אותו כהודעה קולית טבעית.\n"
+    "גם טקסטים ארוכים - אחלק אותם לכמה הקלטות, לפי הסדר.\n"
+    "הבוט מבוסס על פרויקט BlueTTS מאת Max Melichov:\n"
+    "https://github.com/maxmelichov/BlueTTS\n"
+    "מוזמנים לתמוך בכוכב בגיטהאב, או כאן: https://ko-fi.com/maxmelichov"
+)
+
+# Rotated pre-synth ack: one is picked at random before each voice note.
+TTS_ACKS = [
+    "רגע אחד, מכין לכם הודעה קולית... 🎧",
+    "קיבלתי! ממיר את הטקסט לקול, תכף שולח. 🎤",
+    "על זה - מכין את ההקלטה עבורכם... ⏳",
+]
+
+# No readable words at all (emoji / sticker text / numbers / symbols only).
+TTS_NO_TEXT = "אין כאן טקסט להקראה. שלחו לי מילה או משפט (בעברית או אנגלית) ואשמיע אותם בקול. 🎤"
+
+# Has letters, but not Hebrew/English (Russian/Cyrillic, Arabic, ...).
+TTS_LANG_ONLY = "אני מקריא עברית ואנגלית בלבד. 🎧 שלחו טקסט באחת מהשפות האלה ואשמיע אותו."
+
+# Text longer than max_chunks notes: voice the first max_chunks, then tell the user the rest was cut.
+TTS_TRUNCATED = "הטקסט היה ארוך - הקראתי את החלק הראשון. שלחו את ההמשך בנפרד אם תרצו. 🎧"
+
+
+def _tts_ack():
+    return random.choice(TTS_ACKS)
+
+
+def _tts_ack_parts(n):
+    """Long text: say up front how many voice notes are coming, and that they're in order."""
+    return (f"קיבלתי טקסט ארוך. אני מחלק אותו ל-{n} חלקים ושולח אותם אחד אחרי השני, "
+            f"לפי הסדר. אין צורך לשלוח שוב. 🎧")
+
 
 class LeakyBucket:
     def __init__(self, max_messages_per_hour, max_minutes_per_hour):
@@ -234,6 +298,53 @@ class WhatsAppBot:
         if debug:
             self.logger.setLevel(logging.DEBUG)
             logging.getLogger('ivrit').setLevel(logging.DEBUG)
+
+        # Optional text-to-speech (off unless TTS_ENABLED=1). When it is on, a plain text
+        # message is answered with a spoken Hebrew voice note. This is separate from
+        # transcription, and if anything below fails it just turns itself off, so the
+        # transcription side always keeps working.
+        self.tts_enabled = os.getenv('TTS_ENABLED', '0') == '1'
+        self.tts_voice = os.getenv('TTS_VOICE', 'Male1')
+        # How long ONE voice note is (chars). Long text is SPLIT into several voice notes at
+        # sentence/paragraph bounds (text_utils.split_for_whatsapp) instead of being refused.
+        self.tts_max_chars = int(os.getenv('TTS_MAX_CHARS', str(text_utils.MAX_CHARS)))
+        # The most voice notes we make for one message. Past this the whole message is too
+        # long to read aloud, and we reply asking for a shorter one instead.
+        self.tts_max_chunks = int(os.getenv('TTS_MAX_CHUNKS', str(text_utils.MAX_CHUNKS)))
+        # A separate limit on how many voice notes we make at the same time. It is kept
+        # apart from the transcription limit on purpose, so a rush of text messages can
+        # never use up all the worker threads and stall transcription.
+        self.tts_semaphore = threading.BoundedSemaphore(max(1, num_workers))
+        # Dedup guard: SQS can deliver the same message more than once. We remember the
+        # message ids we have already started a voice note for, so a re-delivery does not
+        # make a second one. Capped so it can never grow without bound (oldest evicted).
+        self._tts_seen_ids = collections.OrderedDict()
+        self._tts_seen_lock = threading.Lock()
+        self._tts_seen_max = 2000
+        # Users we have already greeted. In memory only, so it resets on restart; a user
+        # may then be greeted once more, which is harmless.
+        self._tts_welcomed = set()
+        self._tts_welcomed_lock = threading.Lock()
+        self._tts = None
+        if self.tts_enabled:
+            try:
+                import tts_router as _tts_module
+                self._tts = _tts_module
+                self.logger.info(f"Text-to-speech is on (voice={self.tts_voice})")
+                # Report the RunPod-overflow capacity so a misconfiguration is not silent.
+                # A synth holds one tts_semaphore permit (size num_workers) for its whole run,
+                # so at most num_workers run at once; the Space serves HF_CONCURRENCY of them and
+                # the rest overflow to RunPod. If HF_CONCURRENCY >= num_workers the Space slots
+                # never fill, so overflow can never fire -- warn loudly instead of failing silently.
+                if _tts_module._runpod_ready():
+                    window = num_workers - _tts_module.HF_CONCURRENCY
+                    if window > 0:
+                        self.logger.info(f"TTS: RunPod overflow enabled for up to {window} synth(s) beyond the {_tts_module.HF_CONCURRENCY} Space slots")
+                    else:
+                        self.logger.warning(f"TTS: RunPod overflow DISABLED -- TTS_HF_CONCURRENCY ({_tts_module.HF_CONCURRENCY}) >= workers ({num_workers}); raise workers or lower TTS_HF_CONCURRENCY")
+            except Exception as e:
+                self.tts_enabled = False
+                self.logger.error(f"Could not load text-to-speech, leaving it off: {e}")
 
     def is_allowed_region(self, phone_number):
         """Check if the phone number is from an allowed region (Israeli, American/Canadian, or European)."""
@@ -381,6 +492,110 @@ class WhatsAppBot:
             print(f"Error sending message to {to_number}: Status {response.status_code}, Response: {response.text}")
             raise
         return response.json()
+
+    def upload_media(self, file_path, mime_type='audio/ogg'):
+        """Upload a local file to WhatsApp and return the media id it gives back.
+
+        This is the mirror image of download_audio. We do NOT set Content-Type here on
+        purpose: requests builds the multipart body and sets the boundary itself.
+        """
+        url = f'{self.base_url}/{self.phone_number_id}/media'
+        headers = {'Authorization': f'Bearer {self.api_token}'}
+        with open(file_path, 'rb') as f:
+            # messaging_product and type are plain text fields; file carries the bytes.
+            files = {
+                'messaging_product': (None, 'whatsapp'),
+                'type': (None, mime_type),
+                'file': (os.path.basename(file_path), f, mime_type),
+            }
+            response = requests.post(url, headers=headers, files=files, timeout=DOWNLOAD_TIMEOUT)
+        try:
+            response.raise_for_status()
+        except requests.exceptions.HTTPError:
+            self.logger.error(f"Error uploading media: Status {response.status_code}, Response: {response.text}")
+            print(f"Error uploading media: Status {response.status_code}, Response: {response.text}")
+            raise
+        return response.json()['id']
+
+    def send_audio_reply(self, to_number, message_id, ogg_path):
+        """Send an already-made OGG voice note as a reply, quoting the user's message.
+
+        Uploads the file to get a media id, sends the audio message, and deletes the local
+        file at the end. Same request as _send_single_message, but with type 'audio'.
+
+        A transient failure (timeout / dropped connection / 429 / 5xx) is retried up to
+        TTS_SEND_RETRIES times with a short backoff, so a passing hiccup does not drop a
+        voice note. A 4xx (bad request / auth) is permanent and raised immediately.
+        """
+        try:
+            url = f'{self.base_url}/{self.phone_number_id}/messages'
+            headers = {
+                'Authorization': f'Bearer {self.api_token}',
+                'Content-Type': 'application/json'
+            }
+            for attempt in range(TTS_SEND_RETRIES):
+                try:
+                    media_id = self.upload_media(ogg_path, 'audio/ogg')
+                    data = {
+                        'messaging_product': 'whatsapp',
+                        'recipient_type': 'individual',
+                        'to': to_number,
+                        'type': 'audio',
+                        # 'voice': True tells WhatsApp to show this as a real voice note (the
+                        # round play bubble), not a plain audio file. It works because the file
+                        # is OGG/Opus mono, which is what WhatsApp requires for a voice message.
+                        'audio': {'id': media_id, 'voice': True},
+                    }
+                    if message_id:
+                        data['context'] = {'message_id': message_id}
+                    self.logger.debug(f"send_audio_reply: to={to_number} (attempt {attempt + 1})")
+                    response = requests.post(url, headers=headers, json=data, timeout=REQUEST_TIMEOUT)
+                    response.raise_for_status()
+                    return response.json()
+                except Exception as e:
+                    # Retry only transient failures, and only while attempts remain; a 4xx or
+                    # the final attempt is raised so the caller's honest "try again" reply fires.
+                    if not _is_transient_http_error(e) or attempt == TTS_SEND_RETRIES - 1:
+                        self.logger.error(f"Error sending audio to {to_number}: {e}")
+                        print(f"Error sending audio to {to_number}: {e}")
+                        raise
+                    self.logger.warning(f"Transient failure sending audio to {to_number} "
+                                        f"(attempt {attempt + 1}/{TTS_SEND_RETRIES}), retrying: {e}")
+                    time.sleep(1.5 * (attempt + 1))
+        finally:
+            # Always delete the temp file, whether the send worked or not.
+            try:
+                os.unlink(ogg_path)
+            except OSError:
+                pass
+
+    def _tts_already_handled(self, message_id):
+        """Return True if we have already started a voice note for this message id.
+
+        Records the id the first time we see it (so a later re-delivery is skipped) and
+        evicts the oldest ids once the record gets large, so it can never grow unbounded.
+        """
+        if not message_id:
+            return False
+        with self._tts_seen_lock:
+            if message_id in self._tts_seen_ids:
+                return True
+            self._tts_seen_ids[message_id] = True
+            while len(self._tts_seen_ids) > self._tts_seen_max:
+                self._tts_seen_ids.popitem(last=False)  # drop the oldest id
+            return False
+
+    def _tts_maybe_welcome(self, from_number, message_id):
+        """Send a one-time welcome the first time a user asks for a voice note."""
+        with self._tts_welcomed_lock:
+            if from_number in self._tts_welcomed:
+                return
+            self._tts_welcomed.add(from_number)
+        try:
+            self.send_reply(from_number, message_id, TTS_WELCOME)
+        except Exception as e:  # a failed welcome must never block the voice note
+            self.logger.error(f"Could not send TTS welcome to {from_number}: {e}")
+            print(f"Could not send TTS welcome to {from_number}: {e}")
 
     def download_audio(self, media_id):
         """Download audio file from WhatsApp."""
@@ -889,6 +1104,99 @@ class WhatsAppBot:
                     if text_body == '/detailed-status':
                         self.handle_detailed_status_command(from_number, message_id)
                         return True
+                    # If text-to-speech is on, answer a text message with a voice note.
+                    # Anything that goes wrong here falls through to the plain text reply
+                    # below, so this can never break the transcription side of the bot.
+                    if self.tts_enabled and self._tts and text_body:
+                        try:
+                            # SQS can deliver the same message twice (e.g. if synthesis runs
+                            # longer than the queue visibility timeout). If we already started
+                            # a voice note for this id, skip silently so we never send two.
+                            if self._tts_already_handled(message_id):
+                                self.logger.info(f"Skipping duplicate TTS delivery from {from_number}")
+                                return True
+                            # Language gate: he/en only (see text_utils.detect_lang);
+                            # unreadable or empty text gets an honest reply.
+                            lang = text_utils.detect_lang(text_body)
+                            if lang is None:
+                                if text_utils.has_letters(text_body):
+                                    # letters, but a script we can't read (Cyrillic/Arabic/...)
+                                    self.send_reply(from_number, message_id, TTS_LANG_ONLY)
+                                else:
+                                    # no readable words at all (emoji / numbers / symbols only)
+                                    self.send_reply(from_number, message_id, TTS_NO_TEXT)
+                                return True
+                            # Long text is SPLIT into several voice notes at sentence/paragraph
+                            # bounds and sent in order, instead of being refused. Only a text
+                            # past the whole budget (more than tts_max_chunks notes) is refused.
+                            chunks = text_utils.split_for_whatsapp(text_body, self.tts_max_chars)
+                            if not chunks:
+                                self.send_reply(from_number, message_id, TTS_NO_TEXT)
+                                return True
+                            # Over budget: voice the first tts_max_chunks notes and note the
+                            # rest was cut (below), instead of refusing the whole message.
+                            truncated = len(chunks) > self.tts_max_chunks
+                            if truncated:
+                                chunks = chunks[:self.tts_max_chunks]
+                            # Rate limit is WORK-based: a text request has no audio length, so we
+                            # pass 0 seconds and charge one message-token PER voice note actually
+                            # sent (below) -- a 5-note message costs 5. Check we have at least one
+                            # token up front.
+                            bucket = self.get_user_bucket(from_number)
+                            if not bucket.can_transcribe(0):
+                                self.send_reply(from_number, message_id,
+                                                "הגעת למכסת ההודעות לשעה. נסה שוב מאוחר יותר.")
+                                return True
+                            # Wait a few seconds for a free synthesis slot. If they are all
+                            # busy, don't hold this worker thread (that could stall the
+                            # transcription side) - tell the user we're busy and stop here,
+                            # rather than dropping through to the "I only transcribe" message.
+                            if not self.tts_semaphore.acquire(timeout=5):
+                                self.logger.info(f"Text-to-speech busy, asking {from_number} to retry")
+                                self.send_reply(from_number, message_id,
+                                                "שירות ההקראה עמוס כרגע. נסה שוב בעוד רגע.")
+                                return True
+                            try:
+                                # Greet a first-time user, then tell everyone what's coming: a
+                                # rotated one-liner for a single clip, or an explicit part count
+                                # for several, before the (slower) synthesis starts.
+                                self._tts_maybe_welcome(from_number, message_id)
+                                if len(chunks) > 1:
+                                    self.send_reply(from_number, message_id, _tts_ack_parts(len(chunks)))
+                                else:
+                                    self.send_reply(from_number, message_id, _tts_ack())
+                                self._set_activity(f"making {len(chunks)} voice note(s) for {from_number}")
+                                self.send_typing_indicator(message_id)
+                                # Synthesize each chunk and send it as its own voice note IN
+                                # ORDER. Only the first clip quotes the user's message; the rest
+                                # are continuations. A small pacing gap between sends keeps rapid
+                                # replies from bursting the WhatsApp API into throttling.
+                                for idx, chunk in enumerate(chunks):
+                                    out_path = os.path.join(tempfile.gettempdir(), f"tts_{uuid.uuid4().hex}.ogg")
+                                    # synthesize_routed picks the backend by capacity: the HF
+                                    # Space first, spilling to RunPod only when the Space is full
+                                    # or errors.
+                                    ogg = self._tts.synthesize_routed(chunk, out_path,
+                                                                      voice=self.tts_voice, lang=lang)
+                                    self.send_audio_reply(from_number,
+                                                          message_id if idx == 0 else None, ogg)
+                                    bucket.consume(0)  # one token per voice note actually sent
+                                    if idx < len(chunks) - 1:
+                                        time.sleep(TTS_SEND_GAP)
+                                if truncated:
+                                    self.send_reply(from_number, message_id, TTS_TRUNCATED)
+                                return True
+                            finally:
+                                self.tts_semaphore.release()
+                        except Exception as e:
+                            # A synth or send error: tell the user honestly and stop, instead of
+                            # falling through to the "I only transcribe" message, which would
+                            # wrongly imply text-to-speech is not available at all.
+                            self.logger.error(f"Text-to-speech failed for {from_number}: {e}")
+                            print(f"Text-to-speech failed for {from_number}: {e}")
+                            self.send_reply(from_number, message_id,
+                                            "לא הצלחתי להפיק כעת הקראה קולית. נסה שוב בעוד רגע.")
+                            return True
                     self.logger.info(f"Ignoring non-voice message of type: {message_type} from {from_number}")
                     self.send_reply(from_number, message_id, "נכון להיום אני יודע לתמלל הקלטות, לא מעבר לזה.")
                     return True
