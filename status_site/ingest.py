@@ -31,6 +31,9 @@ log = logging.getLogger(__name__)
 # Messages the hub handled itself are attributed to this instance in the statistics.
 HUB = "hub"
 
+# The bot's statuses that mean it is in a group ("left" and "kicked" mean it is not).
+GROUP_PRESENT = ("member", "administrator", "restricted")
+
 SOURCES = {"whatsapp": whatsapp, "telegram": telegram}
 
 webhooks = APIRouter()
@@ -92,8 +95,19 @@ def _route(source, items):
                 continue
             parsed = adapter.parse(body)
             if parsed["type"] == "membership":
-                control.handle_membership(cur, parsed)
+                if parsed.get("group"):
+                    stats.set_telegram_group(cur, parsed["sender"], parsed["member_status"] in GROUP_PRESENT)
+                else:
+                    control.handle_membership(cur, parsed)
                 continue
+            if source == "telegram" and parsed.get("group"):
+                # Any message proves the bot is there - which also picks up groups it
+                # joined before their membership was tracked.
+                if parsed.get("migrate_to"):
+                    stats.set_telegram_group(cur, parsed["sender"], False)
+                    stats.set_telegram_group(cur, parsed["migrate_to"], True)
+                else:
+                    stats.set_telegram_group(cur, parsed["sender"], True)
             default = adapter.target(parsed)
             user_key = parsed["user_key"]
 

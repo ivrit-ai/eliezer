@@ -72,15 +72,15 @@ MEDIA_FIELDS = (("voice", "audio"), ("audio", "audio"),
 
 def split(update):
     """Yield (update_id, sent_at, body) for the one update in a delivery: a message in a
-    private chat or group, or a private chat's membership change (the user blocked or
-    restarted the bot). Being added to or removed from a group needs no action."""
+    private chat or group, or a change in the bot's membership of one - a user blocking
+    or restarting it, or the bot being added to or removed from a group."""
     message = update.get("message")
     member = update.get("my_chat_member")
     if message:
         if (message.get("chat") or {}).get("type") not in ("private",) + GROUP_TYPES:
             return
         event = message
-    elif member and (member.get("chat") or {}).get("type") == "private":
+    elif member and (member.get("chat") or {}).get("type") in ("private",) + GROUP_TYPES:
         event = member
     else:
         return
@@ -104,7 +104,8 @@ def parse(body):
         chat_id = str(member["chat"]["id"])
         return {"sender": chat_id, "user_key": f"tg:{chat_id}", "message_id": None,
                 "type": "membership", "kind": None, "text": None, "media": None,
-                "member_status": (member.get("new_chat_member") or {}).get("status")}
+                "member_status": (member.get("new_chat_member") or {}).get("status"),
+                "group": member["chat"].get("type") in GROUP_TYPES}
     message = body["message"]
     chat_id = str(message["chat"]["id"])
     # In a group, replies go to the group but limits and statistics follow the person.
@@ -133,6 +134,8 @@ def parse(body):
         "text": text if mtype == "text" else None,
         "media": media,
         "group": message["chat"].get("type") in GROUP_TYPES,
+        # A group upgraded to a supergroup continues under this new chat id.
+        "migrate_to": message.get("migrate_to_chat_id"),
     }
 
 

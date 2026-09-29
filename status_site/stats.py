@@ -91,6 +91,20 @@ def init_db():
             "ALTER TABLE totals ADD COLUMN IF NOT EXISTS wa_sent BIGINT NOT NULL DEFAULT 0;"
         )
         cur.execute(
+            "ALTER TABLE totals ADD COLUMN IF NOT EXISTS tg_sent BIGINT NOT NULL DEFAULT 0;"
+        )
+        # Telegram groups the bot is in. Chat ids only; active turns off when it leaves.
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS telegram_groups (
+              chat_id    TEXT PRIMARY KEY,
+              active     BOOLEAN NOT NULL,
+              first_seen TIMESTAMPTZ NOT NULL DEFAULT now(),
+              updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            );
+            """
+        )
+        cur.execute(
             "ALTER TABLE totals ADD COLUMN IF NOT EXISTS dropped BIGINT NOT NULL DEFAULT 0;"
         )
         # WhatsApp messages ignored because their sender has not linked while WhatsApp
@@ -257,6 +271,16 @@ def heartbeat(cur, instance_id, uptime_seconds, queue_depth, client_ip):
     )
 
 
+def set_telegram_group(cur, chat_id, active):
+    """Record that the bot is (or is no longer) in a Telegram group."""
+    cur.execute(
+        "INSERT INTO telegram_groups (chat_id, active) VALUES (%s, %s) "
+        "ON CONFLICT (chat_id) DO UPDATE SET active = EXCLUDED.active, updated_at = now() "
+        "WHERE telegram_groups.active IS DISTINCT FROM EXCLUDED.active;",
+        (str(chat_id), active),
+    )
+
+
 def cache_messages(cur, instance_id, message_minutes):
     """Add committed message events to the in-process 1h graph."""
     if not message_minutes:
@@ -275,17 +299,19 @@ def compute_stats(queue_depth=None):
     """Everything /api/stats serves. queue_depth is the hub's live depth."""
     with connect() as conn, conn.cursor() as cur:
         cur.execute(
-            "SELECT messages, transcriptions, duration_seconds, dropped, wa_sent, dropped_unlinked "
+            "SELECT messages, transcriptions, duration_seconds, dropped, wa_sent, tg_sent, dropped_unlinked "
             "FROM totals WHERE id = 1;"
         )
         totals = cur.fetchone() or {
             "messages": 0, "transcriptions": 0, "duration_seconds": 0, "dropped": 0,
-            "wa_sent": 0, "dropped_unlinked": 0,
+            "wa_sent": 0, "tg_sent": 0, "dropped_unlinked": 0,
         }
         cur.execute(
             "SELECT count(DISTINCT user_id) AS n FROM identities WHERE channel <> 'whatsapp';"
         )
         linked_users = int(cur.fetchone()["n"])
+        cur.execute("SELECT count(*) AS n FROM telegram_groups WHERE active;")
+        telegram_groups = int(cur.fetchone()["n"])
 
         cur.execute(
             """
@@ -391,6 +417,7 @@ def compute_stats(queue_depth=None):
                 "duration_seconds": totals["duration_seconds"],
                 "dropped": totals["dropped"],
                 "wa_sent": totals["wa_sent"],
+                "tg_sent": totals["tg_sent"],
                 "dropped_unlinked": totals["dropped_unlinked"],
             },
             "messages": {
@@ -408,6 +435,7 @@ def compute_stats(queue_depth=None):
             },
             "unique_users_24h": unique_users_24h,
             "linked_users": linked_users,
+            "telegram_groups": telegram_groups,
             "queue_depth": queue_depth,
             "instances": [
                 {

@@ -23,6 +23,8 @@ log = logging.getLogger(__name__)
 
 # Channel adapters (see channel.py for what each provides).
 CHANNELS = {"whatsapp": whatsapp, "telegram": telegram}
+# Messages delivered per channel, for the dashboard. WhatsApp's is the one it bills.
+SENT_COUNTERS = {"whatsapp": "wa_sent", "telegram": "tg_sent"}
 
 SENDER_THREADS = int(os.environ.get("OUTBOX_SENDERS", "4"))
 # A claimed row is invisible to other senders for this long; a sender that dies mid-send
@@ -159,8 +161,9 @@ def _deliver(row):
         adapter.send_text(row["address"], parts[i]["text"], parts[i].get("quote"), parts[i].get("buttons"))
         # Record each part as it goes, so a retry after a failure resumes here.
         _execute("UPDATE outbox SET parts_sent = %s WHERE id = %s;", (i + 1, row["id"]))
-        if row["channel"] == "whatsapp":
-            _execute("UPDATE totals SET wa_sent = wa_sent + 1 WHERE id = 1;", ())
+        counter = SENT_COUNTERS.get(row["channel"])
+        if counter:
+            _execute(f"UPDATE totals SET {counter} = {counter} + 1 WHERE id = 1;", ())
 
 
 def _unbind(channel, address):
