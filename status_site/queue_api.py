@@ -23,9 +23,11 @@ import signal
 import threading
 import time
 
+import psycopg
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import StreamingResponse
+from psycopg.rows import dict_row
 from starlette.background import BackgroundTask
 
 import analytics
@@ -97,7 +99,9 @@ def _params(**extra):
 
 
 def init_queue_db():
-    with db.pool().connection() as conn, conn.cursor() as cur:
+    # A plain connection, not the shared pool: this runs in launch.sh's one-shot process,
+    # where a pool left open makes interpreter exit wait 5s on its worker threads.
+    with psycopg.connect(db.DATABASE_URL, row_factory=dict_row) as conn, conn.cursor() as cur:
         # Leases mint receipt handles with gen_random_uuid() (built in from Postgres
         # 13). Fail the boot here, where the platform keeps the old container
         # running, rather than on the first lease.
