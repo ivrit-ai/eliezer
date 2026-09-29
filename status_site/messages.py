@@ -18,6 +18,18 @@ def rate_limited(minutes):
 
 TOO_LARGE = "הקובץ גדול מדי. אפשר לשלוח קבצים של עד 20MB."
 
+# Sent after every transcript delivered on WhatsApp, as its own message so the transcript
+# stays clean to copy.
+WA_PRICING_NOTICE = """שלום,
+
+וואטסאפ מתחילה לגבות תשלום מאתנו עבור הודעות התמלול שאליעזר שולח אליכם.
+בהתאם לכך, אנו מבצעים שינויים שיאפשרו את המשך הפעלת השירות.
+
+בימים הקרובים נפרסם פרטים נוספים באתר status.eliezer.ivrit.ai.
+מוזמנים לעקוב שם בכדי שתוכלו להמשיך להשתמש באליעזר.
+
+צוות ivrit.ai"""
+
 # --- linking (Telegram <-> WhatsApp)
 
 TG_WELCOME = (

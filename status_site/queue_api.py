@@ -475,8 +475,11 @@ def _complete(handle, text, error, transcription_seconds, duration, edge):
         reply = text if transcribed else messages.ONLY_RECORDINGS
         nudge = messages.maybe_nudge() if transcribed else None
         for i, target in enumerate(targets):
+            # Users still getting transcripts on WhatsApp are told WhatsApp now charges
+            # for these messages, after each one.
+            notice = messages.WA_PRICING_NOTICE if transcribed and target["channel"] == "whatsapp" else None
             outbox.enqueue_text(
-                cur, target, reply, row["sent_at"], extra=[nudge],
+                cur, target, reply, row["sent_at"], extra=[notice, nudge],
                 source_handle=handle if i == 0 else f"{handle}#{i}",
             )
         minutes = []
