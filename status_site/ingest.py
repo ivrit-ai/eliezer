@@ -15,12 +15,15 @@ from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse, PlainTextResponse
 
 import analytics
+import control
 import db
+import identity
 import limits
 import messages
 import outbox
 import queue_api
 import stats
+import telegram
 import whatsapp
 
 log = logging.getLogger(__name__)
@@ -28,7 +31,7 @@ log = logging.getLogger(__name__)
 # Messages the hub handled itself are attributed to this instance in the statistics.
 HUB = "hub"
 
-SOURCES = {"whatsapp": whatsapp}
+SOURCES = {"whatsapp": whatsapp, "telegram": telegram}
 
 webhooks = APIRouter()
 
@@ -55,7 +58,7 @@ async def webhook_receive(source: str, request: Request):
     raw = await request.body()
     if not adapter.verify_payload(raw, request.headers):
         log.warning(
-            "webhook %s REJECTED: signature mismatch (%s bytes) - check META_APP_SECRET",
+            "webhook %s REJECTED: signature mismatch (%s bytes) - check the channel's secret",
             source, len(raw),
         )
         return JSONResponse({"error": "forbidden"}, status_code=403)
@@ -77,7 +80,7 @@ def _route(source, items):
     """Handle one delivery's messages in a single transaction: all of it lands, or
     none of it and the platform retries."""
     adapter = SOURCES[source]
-    counts = {"queued": 0, "answered": 0, "ignored": 0, "duplicate": 0, "stale": 0}
+    counts = {"queued": 0, "answered": 0, "ignored": 0, "unlinked": 0, "duplicate": 0, "stale": 0}
     events, after = [], []
     with db.pool().connection() as conn, conn.cursor() as cur:
         for message_id, sent_at, body in items:
@@ -88,40 +91,88 @@ def _route(source, items):
                 counts["duplicate"] += 1
                 continue
             parsed = adapter.parse(body)
-            target = adapter.target(parsed)
-            user = parsed["sender"]
+            if parsed["type"] == "membership":
+                control.handle_membership(cur, parsed)
+                continue
+            default = adapter.target(parsed)
+            user_key = parsed["user_key"]
 
-            if source == "whatsapp" and not limits.is_allowed_region(user):
-                outbox.enqueue_text(cur, target, messages.REJECTED_REGION, sent_at)
+            if source == "whatsapp" and not limits.is_allowed_region(parsed["sender"]):
+                # Allowlisted numbers are an admin's call; everyone else is refused -
+                # on WhatsApp, and so only while WhatsApp replies are on at all.
+                if identity.user_of(cur, "whatsapp", parsed["sender"]) is None:
+                    if identity.policy(cur) == "reply":
+                        outbox.enqueue_text(cur, default, messages.REJECTED_REGION, sent_at)
+                        counts["answered"] += 1
+                    else:
+                        counts["unlinked"] += 1
+                    continue
+
+            text = parsed["text"]
+            if source == "whatsapp" and control.is_whatsapp_link(text):
+                # Linking must work for exactly the people WhatsApp is being turned off
+                # for, so it comes before any decision about where replies go.
+                outbox.enqueue_receipt(cur, default, typing=False, sent_at=sent_at)
+                control.handle_whatsapp_link(cur, parsed, sent_at)
                 counts["answered"] += 1
                 continue
 
+            if source == "telegram" and parsed["type"] == "text":
+                events.append(_message_event(parsed))
+                after.append((user_key, {"user": user_key, "type": "text", "job_id": str(uuid.uuid4())}))
+                control.handle_telegram_text(cur, parsed, sent_at)
+                counts["answered"] += 1
+                continue
+
+            targets = identity.resolve_targets(cur, source, parsed, default)
+            if not targets:
+                # An unlinked WhatsApp user while WhatsApp replies are off: no reply, and
+                # no read receipt either, which would read as "seen and ignored".
+                counts["unlinked"] += 1
+                continue
+            if source == "whatsapp" and (parsed["kind"] or parsed["type"] == "text"):
+                # Blue ticks cost nothing, and tell the user their message arrived even
+                # when the reply goes elsewhere.
+                outbox.enqueue_receipt(cur, default, typing=False, sent_at=sent_at)
+
             job_id = str(uuid.uuid4())
             if parsed["kind"]:
+                size = (parsed["media"] or {}).get("size")
+                if source == "telegram" and size and size > telegram.MAX_FILE_BYTES:
+                    for target in targets:
+                        outbox.enqueue_text(cur, target, messages.TOO_LARGE, sent_at)
+                    counts["answered"] += 1
+                    continue
                 # Counted when an edge first leases it, like the edges always did.
-                queue_api.enqueue(cur, source, body, sent_at, job_id)
-                outbox.enqueue_receipt(cur, target, typing=False, sent_at=sent_at)
+                queue_api.enqueue(cur, source, body, sent_at, job_id, targets)
                 counts["queued"] += 1
                 continue
 
-            events.append({"kind": "message", "ts": time.time(), "message_type": parsed["type"],
-                           "user_hash": stats.user_hash(user)})
-            after.append((user, {"user": user, "type": parsed["type"], "job_id": job_id}))
+            events.append(_message_event(parsed))
+            after.append((user_key, {"user": user_key, "type": parsed["type"], "job_id": job_id}))
             if parsed["type"] != "text":
                 # Stickers, images, reactions...: counted, otherwise left alone.
                 counts["ignored"] += 1
                 continue
-            outbox.enqueue_receipt(cur, target, typing=False, sent_at=sent_at)
-            outbox.enqueue_text(cur, target, _answer(parsed["text"]), sent_at)
+            for target in targets:
+                outbox.enqueue_text(cur, target, _answer(text), sent_at)
             counts["answered"] += 1
 
         queue_api.count_dropped(cur, counts["stale"])
+        if counts["unlinked"]:
+            cur.execute("UPDATE totals SET dropped_unlinked = dropped_unlinked + %s WHERE id = 1;",
+                        (counts["unlinked"],))
         minutes = stats.write_events(cur, HUB, events)
         conn.commit()
         stats.cache_messages(cur, HUB, minutes)
     for user, props in after:
         analytics.capture(user, "message-received", props, HUB)
     return counts
+
+
+def _message_event(parsed):
+    return {"kind": "message", "ts": time.time(), "message_type": parsed["type"],
+            "user_hash": stats.user_hash(parsed["user_key"])}
 
 
 def _answer(text):

@@ -94,6 +94,11 @@ def init_db():
         cur.execute(
             "ALTER TABLE totals ADD COLUMN IF NOT EXISTS dropped BIGINT NOT NULL DEFAULT 0;"
         )
+        # WhatsApp messages ignored because their sender has not linked while WhatsApp
+        # replies are off: how many users the move to Telegram has not reached yet.
+        cur.execute(
+            "ALTER TABLE totals ADD COLUMN IF NOT EXISTS dropped_unlinked BIGINT NOT NULL DEFAULT 0;"
+        )
         cur.execute(
             """
             CREATE TABLE IF NOT EXISTS events (
@@ -288,13 +293,17 @@ def compute_stats(queue_depth=None):
     """Everything /api/stats serves. queue_depth is the hub's live depth."""
     with connect() as conn, conn.cursor() as cur:
         cur.execute(
-            "SELECT messages, transcriptions, duration_seconds, dropped, wa_sent "
+            "SELECT messages, transcriptions, duration_seconds, dropped, wa_sent, dropped_unlinked "
             "FROM totals WHERE id = 1;"
         )
         totals = cur.fetchone() or {
             "messages": 0, "transcriptions": 0, "duration_seconds": 0, "dropped": 0,
-            "wa_sent": 0,
+            "wa_sent": 0, "dropped_unlinked": 0,
         }
+        cur.execute(
+            "SELECT count(DISTINCT user_id) AS n FROM identities WHERE channel <> 'whatsapp';"
+        )
+        linked_users = int(cur.fetchone()["n"])
 
         cur.execute(
             """
@@ -400,6 +409,7 @@ def compute_stats(queue_depth=None):
                 "duration_seconds": totals["duration_seconds"],
                 "dropped": totals["dropped"],
                 "wa_sent": totals["wa_sent"],
+                "dropped_unlinked": totals["dropped_unlinked"],
             },
             "messages": {
                 "last_1m": msg["m1"],
@@ -415,6 +425,7 @@ def compute_stats(queue_depth=None):
                 "p95_duration": tr["p95_d"],
             },
             "unique_users_24h": unique_users_24h,
+            "linked_users": linked_users,
             "queue_depth": queue_depth,
             "instances": [
                 {

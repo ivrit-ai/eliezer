@@ -30,10 +30,12 @@ from starlette.background import BackgroundTask
 
 import analytics
 import db
+import identity
 import limits
 import messages
 import outbox
 import stats
+import telegram
 import whatsapp
 
 log = logging.getLogger(__name__)
@@ -56,7 +58,7 @@ MAX_WAIT_SECONDS = 20
 MAX_BATCH = 100
 
 # Platform adapters by queue source: parse(body), target(parsed), open_media(media).
-SOURCES = {"whatsapp": whatsapp}
+SOURCES = {"whatsapp": whatsapp, "telegram": telegram}
 
 # A message an edge may take right now. Shared by lease, depth and the overflow
 # threshold, so all three agree on what "waiting" means.
@@ -142,6 +144,7 @@ def init_queue_db():
             """
         )
         outbox.init_outbox_db(cur)
+        identity.init_identity_db(cur)
         conn.commit()
 
 
@@ -198,6 +201,7 @@ def sweep():
         )
         dropped = cur.fetchall()
         expired_replies = outbox.sweep_expired(cur, MAX_AGE_SECONDS)
+        identity.sweep_tokens(cur)
         cur.execute(
             "DELETE FROM ingest_seen "
             "WHERE seen_at < now() - make_interval(secs => %s::double precision);",
@@ -314,9 +318,9 @@ def _jobs_for(rows, edge, uptime, client_ip):
         })
         if r["receive_count"] == 1:
             events.append({"kind": "message", "ts": time.time(), "message_type": parsed["type"],
-                           "user_hash": stats.user_hash(parsed["sender"])})
-            after.append((parsed["sender"], {"user": parsed["sender"], "type": parsed["type"],
-                                              "job_id": r["job_id"]}))
+                           "user_hash": stats.user_hash(parsed["user_key"])})
+            after.append((parsed["user_key"], {"user": parsed["user_key"], "type": parsed["type"],
+                                                "job_id": r["job_id"]}))
     with db.pool().connection() as conn, conn.cursor() as cur:
         stats.heartbeat(cur, edge, uptime, None, client_ip)
         minutes = stats.write_events(cur, edge, events)
@@ -424,7 +428,7 @@ def _admit(handle, duration, edge):
         row, parsed, targets = _leased(cur, handle, lock=True)
         if row is None:
             return None
-        user = parsed["sender"]
+        user = parsed["user_key"]
         notice = None
         if duration is None:
             notice = messages.DURATION_FAILED
@@ -482,7 +486,7 @@ def _complete(handle, text, error, transcription_seconds, duration, edge):
         if row is None:
             cur.execute("SELECT 1 FROM outbox WHERE source_handle = %s;", (handle,))
             return cur.fetchone() is not None
-        user = parsed["sender"]
+        user = parsed["user_key"]
         transcribed = error is None
         reply = text if transcribed else messages.ONLY_RECORDINGS
         nudge = messages.maybe_nudge() if transcribed else None

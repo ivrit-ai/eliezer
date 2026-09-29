@@ -16,6 +16,63 @@ def rate_limited(minutes):
     )
 
 
+TOO_LARGE = "הקובץ גדול מדי. אפשר לשלוח קבצים של עד 20MB."
+
+# --- linking (Telegram <-> WhatsApp)
+
+TG_WELCOME = (
+    "שלום! אני אליעזר, בוט התמלול של ivrit.ai.\n"
+    "שלחו לי כאן הקלטה ואתמלל אותה.\n\n"
+    "רוצים לקבל כאן גם את התמלולים של הקלטות שאתם שולחים לי בוואטסאפ? "
+    "לחצו על הכפתור, ובוואטסאפ שייפתח שלחו את ההודעה כמו שהיא."
+)
+LINK_BUTTON = "קישור לוואטסאפ"
+
+
+def tg_link_code_hint(token):
+    return f"\n\nאם הכפתור לא עובד, שלחו לאליעזר בוואטסאפ את ההודעה: link {token}"
+
+
+def tg_linked(masked):
+    return (
+        f"✅ המספר {masked} מקושר לצ'אט הזה. "
+        f"מעכשיו התמלולים של ההקלטות שתשלחו בוואטסאפ יגיעו לכאן.\n"
+        f"לביטול הקישור: /unlink"
+    )
+
+
+def tg_already_linked(masked_numbers):
+    return (
+        f"הצ'אט הזה מקושר ל-{', '.join(masked_numbers)}.\n"
+        f"לקישור מספר נוסף לחצו על הכפתור. לביטול הקישור: /unlink"
+    )
+
+
+WA_LINKED = "✅ המספר קושר לטלגרם. מעכשיו התמלולים יישלחו לשם."
+TG_LINK_EXPIRED = "תוקף קוד הקישור פג. שלחו /link לקבלת קוד חדש."
+WA_LINK_UNKNOWN = "קוד הקישור לא תקין. שלחו /link לבוט בטלגרם כדי לקבל קוד חדש."
+
+
+def wa_link_offer(url):
+    return f"כדי לקבל את התמלולים בטלגרם, פתחו את הקישור ולחצו על Start:\n{url}"
+
+
+def tg_moved_away(masked):
+    return f"המספר {masked} קושר לצ'אט טלגרם אחר, והתמלולים שלו לא יגיעו לכאן יותר."
+
+
+def tg_unlinked(masked_numbers):
+    return f"הקישור בוטל. {', '.join(masked_numbers)} לא מקושר יותר לצ'אט הזה."
+
+
+TG_NOTHING_TO_UNLINK = "הצ'אט הזה לא מקושר לאף מספר וואטסאפ."
+TG_HELP = (
+    "שלחו לי הקלטה ואתמלל אותה.\n\n"
+    "/link – קישור לוואטסאפ: התמלולים של הקלטות מוואטסאפ יגיעו לכאן\n"
+    "/unlink – ביטול הקישור\n"
+    "/status – סטטוס השירות"
+)
+
 # Appended to a transcript with probability 1/NUDGE_INTERVAL.
 NUDGE_INTERVAL = int(os.environ.get("NUDGE_INTERVAL", "100"))
 with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "nudge.txt"), encoding="utf-8") as f:

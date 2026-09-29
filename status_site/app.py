@@ -2,6 +2,7 @@ import base64
 import json
 import logging
 import os
+import threading
 from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI, Request
@@ -11,6 +12,7 @@ from fastapi.staticfiles import StaticFiles
 
 import outbox
 import stats
+import telegram
 import whatsapp
 from ingest import webhooks
 from queue_api import (
@@ -59,8 +61,30 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 REQUIRED_SETTINGS = (
     "QUEUE_TOKEN", "META_APP_SECRET", "META_VERIFY_TOKEN", "WHATSAPP_API_TOKEN",
-    "WHATSAPP_PHONE_NUMBER_ID", "STATUS_USER_SALT", "POSTHOG_API_KEY",
+    "WHATSAPP_PHONE_NUMBER_ID", "STATUS_USER_SALT", "POSTHOG_API_KEY", "TELEGRAM_BOT_TOKEN",
 )
+
+# Where Telegram delivers updates; the public name, not whichever host serves this.
+TELEGRAM_WEBHOOK_URL = os.environ.get(
+    "TELEGRAM_WEBHOOK_URL", "https://status.eliezer.ivrit.ai/webhook/telegram"
+)
+
+
+def _register_channels(stop):
+    """Look up the bot's WhatsApp number and point Telegram at this site, retrying until
+    both work: links in the link flow need them, but serving must not wait for them."""
+    pending = {"whatsapp": whatsapp.setup, "telegram": lambda: telegram.setup(TELEGRAM_WEBHOOK_URL)}
+    delay = 5
+    while pending and not stop.is_set():
+        for name, setup in list(pending.items()):
+            try:
+                setup()
+                del pending[name]
+            except Exception as e:
+                logging.getLogger(__name__).warning("%s setup failed, retrying: %s", name, e)
+        if pending:
+            stop.wait(delay)
+            delay = min(delay * 2, 300)
 
 
 @asynccontextmanager
@@ -72,10 +96,14 @@ async def lifespan(app):
     install_shutdown_hook()
     stop_sweeper = start_sweeper()
     stop_senders = outbox.start_senders()
+    stop_setup = threading.Event()
+    threading.Thread(target=_register_channels, args=(stop_setup,), name="ChannelSetup", daemon=True).start()
     yield
+    stop_setup.set()
     stop_senders.set()
     stop_sweeper.set()
     await whatsapp.close()
+    await telegram.close()
 
 
 # No generated docs: the queue and webhook endpoints are not meant to be browsable.

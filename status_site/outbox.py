@@ -14,13 +14,15 @@ import threading
 import time
 
 import db
+import identity
+import telegram
 import whatsapp
+from channel import SendError
 
 log = logging.getLogger(__name__)
 
-# Channel adapters. Each provides MAX_TEXT_LENGTH, send_text(address, text, quote) and
-# send_receipt(address, message_id, typing), raising whatsapp.SendError-compatible errors.
-CHANNELS = {"whatsapp": whatsapp}
+# Channel adapters (see channel.py for what each provides).
+CHANNELS = {"whatsapp": whatsapp, "telegram": telegram}
 
 SENDER_THREADS = int(os.environ.get("OUTBOX_SENDERS", "4"))
 # A claimed row is invisible to other senders for this long; a sender that dies mid-send
@@ -67,10 +69,13 @@ def split_text(channel, text, quote):
     ]
 
 
-def enqueue_text(cur, target, text, sent_at, extra=(), source_handle=None):
+def enqueue_text(cur, target, text, sent_at, extra=(), source_handle=None, buttons=None):
     """Queue a reply to target, in the caller's transaction. extra are further messages
-    sent after it, unquoted (the nudge). sent_at is when the user sent what this answers."""
+    sent after it, unquoted (the nudge); buttons are links shown under the reply, where
+    the channel supports them. sent_at is when the user sent what this answers."""
     parts = split_text(target["channel"], text, target.get("quote"))
+    if buttons:
+        parts[-1]["buttons"] = buttons
     parts += [{"text": e, "quote": None} for e in extra if e]
     cur.execute(
         """
@@ -84,8 +89,11 @@ def enqueue_text(cur, target, text, sent_at, extra=(), source_handle=None):
 
 def enqueue_receipt(cur, target, typing, sent_at):
     """Queue a read receipt (with typing=True, also a typing indicator) for the message
-    target quotes."""
-    if not target.get("quote"):
+    target quotes. WhatsApp receipts need that message; a Telegram typing indicator
+    does not."""
+    if target["channel"] == "whatsapp" and not target.get("quote"):
+        return
+    if target["channel"] != "whatsapp" and not typing:
         return
     cur.execute(
         """
@@ -148,17 +156,32 @@ def _deliver(row):
     for i in range(row["parts_sent"], len(parts)):
         if i > row["parts_sent"]:
             time.sleep(PART_INTERVAL_SECONDS)
-        adapter.send_text(row["address"], parts[i]["text"], parts[i].get("quote"))
+        adapter.send_text(row["address"], parts[i]["text"], parts[i].get("quote"), parts[i].get("buttons"))
         # Record each part as it goes, so a retry after a failure resumes here.
         _execute("UPDATE outbox SET parts_sent = %s WHERE id = %s;", (i + 1, row["id"]))
         if row["channel"] == "whatsapp":
             _execute("UPDATE totals SET wa_sent = wa_sent + 1 WHERE id = 1;", ())
 
 
+def _unbind(channel, address):
+    with db.pool().connection() as conn, conn.cursor() as cur:
+        identity.detach(cur, channel, address)
+        conn.commit()
+
+
 def _send_one(row):
     try:
         _deliver(row)
-    except whatsapp.SendError as e:
+    except SendError as e:
+        if e.gone:
+            # Blocked, deleted, never started: this identity is dead. Unbind it, so
+            # replies for its user fall back to wherever else they may go.
+            log.debug("outbox %s: %s:%s is unreachable (%s); unbinding it",
+                     row["id"], row["channel"], row["address"], e)
+            _unbind(row["channel"], row["address"])
+            _execute("DELETE FROM outbox WHERE channel = %s AND address = %s;",
+                     (row["channel"], row["address"]))
+            return
         if row["action"] == "text" and e.retryable:
             delay = e.retry_after or min(5 * 2 ** (row["attempts"] - 1), MAX_BACKOFF_SECONDS)
             log.debug("outbox %s to %s:%s failed (%s); retry in %ss",

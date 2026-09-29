@@ -14,6 +14,8 @@ import time
 import httpx
 import requests
 
+from channel import SendError
+
 log = logging.getLogger(__name__)
 
 META_APP_SECRET = os.environ.get("META_APP_SECRET", "")
@@ -30,13 +32,6 @@ MEDIA_TIMEOUT = httpx.Timeout(120.0, connect=10.0)
 # Cloud API errors worth retrying even when they arrive as HTTP 400: rate limits and
 # transient server-side failures.
 RETRYABLE_ERROR_CODES = {4, 80007, 130429, 131000, 131016, 131048, 131056, 133004}
-
-
-class SendError(Exception):
-    def __init__(self, message, retryable, retry_after=None):
-        super().__init__(message)
-        self.retryable = retryable
-        self.retry_after = retry_after
 
 
 # --- webhooks
@@ -97,6 +92,7 @@ def parse(body):
         media = {"id": m.get("id"), "mime_type": m.get("mime_type")}
     return {
         "sender": message.get("from"),
+        "user_key": message.get("from"),
         "message_id": message.get("id"),
         "type": mtype,
         "kind": mtype if media else None,  # what the edge must do: audio, or document to convert
@@ -139,7 +135,8 @@ def _post(data):
     )
 
 
-def send_text(address, text, quote=None):
+def send_text(address, text, quote=None, buttons=None):
+    # WhatsApp gets no buttons: any link a reply needs is written into its text.
     data = {
         "messaging_product": "whatsapp",
         "recipient_type": "individual",
@@ -155,10 +152,38 @@ def send_text(address, text, quote=None):
 def send_receipt(address, message_id, typing=False):
     """Blue ticks; with typing=True also shows the typing indicator. Status updates,
     not messages, so WhatsApp does not bill for them."""
+    if not message_id:
+        return None
     data = {"messaging_product": "whatsapp", "status": "read", "message_id": message_id}
     if typing:
         data["typing_indicator"] = {"type": "text"}
     return _post(data)
+
+
+# --- registration
+
+_display_number = None
+
+
+def display_number():
+    """The bot's own WhatsApp number in digits, for wa.me links; None until startup."""
+    return _display_number
+
+
+def setup():
+    """Look up the bot's number, so links to it need no configuration."""
+    global _display_number
+    if not (API_TOKEN and PHONE_NUMBER_ID):
+        return
+    response = requests.get(
+        f"{GRAPH_URL}/{PHONE_NUMBER_ID}",
+        params={"fields": "display_phone_number"},
+        headers={"Authorization": f"Bearer {API_TOKEN}"},
+        timeout=REQUEST_TIMEOUT,
+    )
+    response.raise_for_status()
+    _display_number = "".join(c for c in response.json()["display_phone_number"] if c.isdigit())
+    log.debug("whatsapp: bot number is %s", _display_number)
 
 
 # --- media
