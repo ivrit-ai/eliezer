@@ -8,6 +8,7 @@ independently by setting QUEUE_API_URL; it goes once the SQS queue is retired.
 """
 
 import os
+import socket
 import time
 
 import boto3
@@ -49,10 +50,12 @@ class SqsQueueClient:
 
 
 class HttpQueueClient:
-    def __init__(self, base_url, token):
+    def __init__(self, base_url, token, instance_id):
         self.base_url = base_url.rstrip("/")
         self.session = requests.Session()
         self.session.headers["Authorization"] = f"Bearer {token}"
+        # Lets the site attribute leases to this edge.
+        self.session.headers["X-Instance-Id"] = instance_id
 
     def depth(self):
         r = self.session.get(f"{self.base_url}/queue/depth", timeout=(5, 15))
@@ -88,5 +91,9 @@ class HttpQueueClient:
 def make_queue_client():
     url = os.getenv("QUEUE_API_URL")
     if url:
-        return HttpQueueClient(url, os.getenv("QUEUE_TOKEN", ""))
+        return HttpQueueClient(
+            url,
+            os.getenv("QUEUE_TOKEN", ""),
+            os.getenv("INSTANCE_ID") or socket.gethostname(),
+        )
     return SqsQueueClient()

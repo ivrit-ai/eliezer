@@ -24,9 +24,9 @@ from psycopg_pool import ConnectionPool
 log = logging.getLogger(__name__)
 
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
-# One token per edge (instance_id -> token), so any single edge can be revoked and every
-# lease is attributable to the edge that took it.
-EDGE_TOKENS = json.loads(os.environ.get("EDGE_TOKENS") or "{}")
+# One token shared by every edge, so adding an edge needs no change here. Edges name
+# themselves in X-Instance-Id; that is self-reported, and used only to attribute leases.
+QUEUE_TOKEN = os.environ.get("QUEUE_TOKEN", "")
 # Longer than a job can sit behind a busy edge's transcription semaphore, so a message
 # being worked on is not handed to a second edge.
 VISIBILITY_TIMEOUT = int(os.environ.get("QUEUE_VISIBILITY_TIMEOUT", "900"))
@@ -272,17 +272,12 @@ def _try_lease(n, min_depth, edge):
 
 
 def require_edge(request: Request):
-    """Resolve the bearer token to the edge's instance_id, or reject the request."""
+    """Check the shared bearer token; return the calling edge's self-reported name."""
     header = request.headers.get("Authorization", "")
     token = header[len("Bearer "):] if header.startswith("Bearer ") else ""
-    edge = None
-    for instance_id, expected in EDGE_TOKENS.items():
-        # Compare against every token, so timing does not reveal which one matched.
-        if token and hmac.compare_digest(token.encode(), str(expected).encode()):
-            edge = instance_id
-    if edge is None:
+    if not QUEUE_TOKEN or not hmac.compare_digest(token.encode(), QUEUE_TOKEN.encode()):
         raise HTTPException(status_code=401, detail="unauthorized")
-    return edge
+    return request.headers.get("X-Instance-Id") or "unknown"
 
 
 async def _json_body(request):

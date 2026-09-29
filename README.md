@@ -18,7 +18,7 @@ cp .env.example .env
 
 3. Edit the `.env` file with your credentials:
 - `QUEUE_API_URL`: The status site's URL (unset: fall back to SQS via `APP_SQS_QUEUE`)
-- `QUEUE_TOKEN`: This instance's token, from the site's `EDGE_TOKENS`
+- `QUEUE_TOKEN`: The site's `QUEUE_TOKEN`, shared by every instance
 - `WHATSAPP_API_TOKEN`: Your WhatsApp Business API token
 - `WHATSAPP_PHONE_NUMBER_ID`: Your WhatsApp phone number ID
 
