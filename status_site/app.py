@@ -11,13 +11,15 @@ from datetime import datetime, timezone
 
 import psycopg
 from psycopg.rows import dict_row
-from fastapi import FastAPI, Request
+from fastapi import Depends, FastAPI, Request
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 from ingest import webhooks
-from queue_api import init_queue_db, install_shutdown_hook, queue_api, start_sweeper
+from queue_api import (
+    init_queue_db, install_shutdown_hook, queue_api, require_edge, start_sweeper,
+)
 
 # 32x32 ivrit.ai favicon (PNG), embedded so it can be served without a binary asset.
 FAVICON_PNG = base64.b64decode(
@@ -167,6 +169,9 @@ def init_db():
             );
             """
         )
+        # Where each instance reports from, so an operator can find the machine behind
+        # an instance_id. Exposed only on the token-protected /queue/edges.
+        cur.execute("ALTER TABLE instances ADD COLUMN IF NOT EXISTS last_ip TEXT;")
         # Persistent per-hour message counts for the weekly graph (events are pruned at
         # 25h, so a week of history must live in its own aggregate, surviving restarts).
         cur.execute(
@@ -221,10 +226,12 @@ async def ingest(request: Request):
     if not isinstance(body, dict):
         body = {}
     # The DB work is synchronous; run it off the event loop.
-    return await run_in_threadpool(_ingest, body)
+    # uvicorn runs with --proxy-headers, so this is the caller's address, not the proxy's.
+    client_ip = request.client.host if request.client else None
+    return await run_in_threadpool(_ingest, body, client_ip)
 
 
-def _ingest(body):
+def _ingest(body, client_ip=None):
     instance_id = body.get("instance_id")
     if not instance_id:
         return JSONResponse({"error": "instance_id required"}, status_code=400)
@@ -286,14 +293,15 @@ def _ingest(body):
 
         cur.execute(
             """
-            INSERT INTO instances (instance_id, last_seen, uptime_seconds, queue_depth)
-            VALUES (%s, now(), %s, %s)
+            INSERT INTO instances (instance_id, last_seen, uptime_seconds, queue_depth, last_ip)
+            VALUES (%s, now(), %s, %s, %s)
             ON CONFLICT (instance_id) DO UPDATE
               SET last_seen = now(),
                   uptime_seconds = EXCLUDED.uptime_seconds,
-                  queue_depth = EXCLUDED.queue_depth;
+                  queue_depth = EXCLUDED.queue_depth,
+                  last_ip = EXCLUDED.last_ip;
             """,
-            (instance_id, uptime_seconds, queue_depth),
+            (instance_id, uptime_seconds, queue_depth, client_ip),
         )
 
         # Opportunistic prune so events / hourly buckets don't grow without bound.
@@ -465,6 +473,34 @@ def stats():
             "generated_at": time.time(),
         }
     )
+
+
+@app.get("/queue/edges")
+def edges(caller: str = Depends(require_edge)):
+    """Every instance seen in the last day, with the address it reports from. Behind the
+    queue token: which machines run the fleet is operator information, unlike /api/stats."""
+    with connect() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT instance_id, last_ip, uptime_seconds,
+                   extract(epoch FROM (now() - last_seen)) AS age_seconds
+            FROM instances
+            WHERE last_seen > now() - interval '24 hours'
+            ORDER BY instance_id;
+            """
+        )
+        rows = cur.fetchall()
+    return {
+        "edges": [
+            {
+                "instance_id": r["instance_id"],
+                "ip": r["last_ip"],
+                "uptime_seconds": r["uptime_seconds"],
+                "age_seconds": round(float(r["age_seconds"]), 1),
+            }
+            for r in rows
+        ]
+    }
 
 
 # HEAD is listed explicitly: Flask answered it on every GET route, Starlette does not.
