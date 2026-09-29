@@ -2,7 +2,6 @@ import os
 import sys
 import json
 import asyncio
-import boto3
 import requests
 import tempfile
 import ivrit
@@ -25,6 +24,7 @@ import statistics
 import phonenumbers
 from phonenumbers import region_code_for_number, country_code_for_region
 from status_reporter import StatusReporter
+from queue_client import make_queue_client
 
 # Load environment variables
 load_dotenv()
@@ -150,8 +150,8 @@ class LeakyBucket:
 
 class WhatsAppBot:
     def __init__(self, nudge_interval, user_max_messages_per_hour, user_max_minutes_per_hour, cleanup_frequency, num_workers, local=False, overflow_handler=None, debug=False):
-        self.sqs = boto3.client('sqs')
-        self.queue_url = os.getenv('APP_SQS_QUEUE')
+        self.queue = make_queue_client()
+        self.handlers = {'whatsapp': self.process_message}
         self.api_token = os.getenv('WHATSAPP_API_TOKEN')
         self.phone_number_id = os.getenv('WHATSAPP_PHONE_NUMBER_ID')
         self.api_version = 'v22.0'
@@ -176,15 +176,18 @@ class WhatsAppBot:
         self.stop_event = threading.Event()
         self.worker_threads = []
         # num_workers is the number of concurrent transcriptions. We run twice as
-        # many worker threads so I/O (SQS, media download, ffmpeg, reply) overlaps
+        # many worker threads so I/O (queue, media download, ffmpeg, reply) overlaps
         # with transcription, and gate the transcription step itself with a semaphore.
         self.num_workers = num_workers
         self.num_worker_threads = 2 * num_workers
         self.transcription_semaphore = threading.BoundedSemaphore(num_workers)
         self.overflow_handler = overflow_handler
 
-        # In-process queue: the dispatcher thread fills it from SQS, workers drain it.
-        self.job_queue = queue.Queue(maxsize=2 * self.num_worker_threads)
+        # In-process queue: the dispatcher thread fills it from the message queue,
+        # workers drain it. At most one buffered job per worker thread: a leased job's
+        # visibility timeout starts at lease time, so a deeper local backlog risks it
+        # expiring here and being handed to another edge as well.
+        self.job_queue = queue.Queue(maxsize=self.num_worker_threads)
         
         # Logger
         self.logger = logging.getLogger('whatsapp_bot')
@@ -622,16 +625,12 @@ class WhatsAppBot:
             }
 
     def _queue_depth(self):
-        """Current estimated SQS backlog (visible, not-in-flight messages) as an int,
-        or None if it can't be fetched. Used by /status and the status reporter heartbeat."""
+        """Current backlog (visible, not-in-flight messages) as an int, or None if it
+        can't be fetched. Used by /status and the status reporter heartbeat."""
         try:
-            attrs = self.sqs.get_queue_attributes(
-                QueueUrl=self.queue_url,
-                AttributeNames=['ApproximateNumberOfMessages'],
-            )
-            return int(attrs['Attributes']['ApproximateNumberOfMessages'])
+            return self.queue.depth()
         except Exception as e:
-            self.logger.error(f"Error fetching SQS queue depth: {str(e)}")
+            self.logger.error(f"Error fetching queue depth: {str(e)}")
             return None
 
     def _local_view(self, snap):
@@ -1013,52 +1012,28 @@ class WhatsAppBot:
             return False
 
     def dispatcher(self):
-        """Single thread that reads SQS and feeds jobs to the worker pool."""
+        """Single thread that reads the queue and feeds jobs to the worker pool."""
         threading.current_thread().name = "Dispatcher"
         self.logger.info("Dispatcher thread started")
 
         while not self.stop_event.is_set():
             try:
                 free = self.job_queue.maxsize - self.job_queue.qsize()
-
-                # Overflow mode: only take messages above the threshold.
-                if self.overflow_handler is not None:
-                    self._set_activity("probing queue depth")
-                    attrs = self.sqs.get_queue_attributes(
-                        QueueUrl=self.queue_url,
-                        AttributeNames=['ApproximateNumberOfMessages'],
-                    )
-                    pending = int(attrs['Attributes']['ApproximateNumberOfMessages'])
-                    free = min(free, pending - self.overflow_handler)
-                    self.logger.debug(
-                        f"Queue depth {pending}, overflow threshold "
-                        f"{self.overflow_handler}, can pull {free}")
-
                 if free < 1:
-                    # No room locally, or at/below the overflow threshold.
                     self.stop_event.wait(IDLE_PROBE_INTERVAL)
                     continue
 
-                self._set_activity("polling SQS")
-                # Pull up to one job per worker thread this cycle. SQS caps a single
-                # ReceiveMessage at 10, so loop to reach the target: long-poll the
-                # first request, then short-poll the rest, stopping when drained.
+                self._set_activity("polling queue")
+                # Pull up to one job per worker thread this cycle. In overflow mode the
+                # server leases only what sits above the threshold, in the same call.
                 target = min(free, self.num_worker_threads)
-                fetched = 0
-                wait = 20
-                while fetched < target and not self.stop_event.is_set():
-                    response = self.sqs.receive_message(
-                        QueueUrl=self.queue_url,
-                        MaxNumberOfMessages=min(target - fetched, 10),
-                        WaitTimeSeconds=wait
-                    )
-                    messages = response.get('Messages', [])
-                    if not messages:
-                        break
-                    for message in messages:
-                        self.job_queue.put(message)  # guaranteed room -> won't block
-                    fetched += len(messages)
-                    wait = 0
+                messages = self.queue.lease(
+                    target, 20, min_depth=self.overflow_handler or 0)
+                self.logger.debug(
+                    f"Leased {len(messages)} message(s), target {target}, "
+                    f"overflow threshold {self.overflow_handler}")
+                for message in messages:
+                    self.job_queue.put(message)  # guaranteed room -> won't block
 
             except Exception as e:
                 self.logger.error(f"Error in dispatcher thread: {str(e)}")
@@ -1082,17 +1057,19 @@ class WhatsAppBot:
                     continue
 
                 try:
-                    # Parse message body
-                    message_body = json.loads(message['Body'])
+                    handler = self.handlers.get(message['source'])
+                    if handler is None:
+                        # A platform this build doesn't know about: ack rather than
+                        # retry, so it can't loop until it hits the drop threshold.
+                        self.logger.debug(
+                            f"Discarding message from unknown source "
+                            f"'{message['source']}'")
+                        self.queue.ack(message['handle'])
+                        continue
 
-                    # Process the message
                     self._set_activity("processing message")
-                    if self.process_message(message_body):
-                        # Delete message from queue if processed successfully
-                        self.sqs.delete_message(
-                            QueueUrl=self.queue_url,
-                            ReceiptHandle=message['ReceiptHandle']
-                        )
+                    if handler(json.loads(message['body'])):
+                        self.queue.ack(message['handle'])
                 except Exception as e:
                     self.logger.error(f"Error processing message: {str(e)}")
                 finally:
@@ -1104,7 +1081,7 @@ class WhatsAppBot:
                 continue
 
     def run(self):
-        """Start worker threads to poll SQS."""
+        """Start worker threads to poll the queue."""
         # Set main thread name
         threading.current_thread().name = "Main"
         
@@ -1123,7 +1100,7 @@ class WhatsAppBot:
             thread.start()
             self.logger.info(f"Started thread {thread.name}")
         
-        # Start dispatcher thread (sole SQS reader, feeds the worker pool)
+        # Start dispatcher thread (sole queue reader, feeds the worker pool)
         dispatcher_thread = threading.Thread(
             target=self.dispatcher,
             name="Dispatcher",
@@ -1176,7 +1153,7 @@ if __name__ == "__main__":
     parser.add_argument('--cleanup-frequency', type=int, default=50, help='Perform bucket cleanup every N transcriptions')
     parser.add_argument('--num-workers', type=int, default=None, help='Number of concurrent transcriptions (default: 10, or 1 in --local mode); the bot runs 2x this many worker threads to overlap I/O')
     parser.add_argument('--local', action='store_true', help='Transcribe locally with faster-whisper instead of RunPod')
-    parser.add_argument('--overflow-handler', type=int, default=None, metavar='N', help='Only handle jobs when the SQS queue depth exceeds N')
+    parser.add_argument('--overflow-handler', type=int, default=None, metavar='N', help='Only handle jobs when the queue depth exceeds N')
     parser.add_argument('--debug', action='store_true', help='Enable debug logging (verbose output to console and file)')
     args = parser.parse_args()
 

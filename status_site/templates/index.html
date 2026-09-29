@@ -290,6 +290,7 @@
           card("Median transcription (1h)", tr.median_duration != null ? fmtDuration(tr.median_duration) : "–"),
           card("p95 transcription (1h)",    tr.p95_duration   != null ? fmtDuration(tr.p95_duration)    : "–"),
           card("Queue depth",              fmtNum(d.queue_depth)),
+          card("Dropped",                  fmtNum(t.dropped)),
           card("Live instances",           fmtNum(d.live_instances)),
         ].join("");
 

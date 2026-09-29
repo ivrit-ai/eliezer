@@ -1,10 +1,12 @@
 import base64
 import json
+import logging
 import os
 import random
 import threading
 import time
 from collections import defaultdict
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
 import psycopg
@@ -13,6 +15,9 @@ from fastapi import FastAPI, Request
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
+
+from ingest import webhooks
+from queue_api import init_queue_db, install_shutdown_hook, queue_api, start_sweeper
 
 # 32x32 ivrit.ai favicon (PNG), embedded so it can be served without a binary asset.
 FAVICON_PNG = base64.b64decode(
@@ -40,12 +45,30 @@ FAVICON_PNG = base64.b64decode(
     "yf/Gfn489swlzwAAAABJRU5ErkJggg=="
 )
 
+# Nothing configures logging otherwise, so only WARNING+ would reach the runtime log
+# via logging's last-resort handler. Diagnostics stay at DEBUG; set LOG_LEVEL=DEBUG to
+# see them during a cutover, when knowing which payloads arrived is the whole game.
+logging.basicConfig(
+    level=os.environ.get("LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s %(levelname)s %(name)s - %(message)s",
+)
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-# No generated docs: the Flask app exposed exactly these routes, and the queue/webhook
-# endpoints coming next are not meant to be browsable.
-app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
+
+@asynccontextmanager
+async def lifespan(app):
+    install_shutdown_hook()
+    stop_sweeper = start_sweeper()
+    yield
+    stop_sweeper.set()
+
+
+# No generated docs: the queue and webhook endpoints are not meant to be browsable.
+app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None, lifespan=lifespan)
 app.mount("/static", StaticFiles(directory=os.path.join(BASE_DIR, "static")), name="static")
+app.include_router(queue_api)
+app.include_router(webhooks)
 
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
 INGEST_TOKEN = os.environ.get("INGEST_TOKEN", "")
@@ -295,8 +318,12 @@ def _ingest(body):
 @app.get("/api/stats")
 def stats():
     with connect() as conn, conn.cursor() as cur:
-        cur.execute("SELECT messages, transcriptions, duration_seconds FROM totals WHERE id = 1;")
-        totals = cur.fetchone() or {"messages": 0, "transcriptions": 0, "duration_seconds": 0}
+        cur.execute(
+            "SELECT messages, transcriptions, duration_seconds, dropped FROM totals WHERE id = 1;"
+        )
+        totals = cur.fetchone() or {
+            "messages": 0, "transcriptions": 0, "duration_seconds": 0, "dropped": 0,
+        }
 
         cur.execute(
             """
@@ -405,6 +432,7 @@ def stats():
                 "messages": totals["messages"],
                 "transcriptions": totals["transcriptions"],
                 "duration_seconds": totals["duration_seconds"],
+                "dropped": totals["dropped"],
             },
             "messages": {
                 "last_1m": msg["m1"],
