@@ -1,7 +1,6 @@
 """Fleet statistics: the events and aggregates behind the dashboard and /status.
 
-Written by the hub itself as it moves messages (see queue_api.py and ingest.py), and by
-edges still reporting over /api/events.
+Written by the hub itself as it moves messages (see queue_api.py and ingest.py).
 """
 
 import hashlib
@@ -270,23 +269,6 @@ def cache_messages(cur, instance_id, message_minutes):
             return
         for m in message_minutes:
             _series_counts[m][instance_id] += 1
-
-
-def ingest_events(body, client_ip=None):
-    """An edge's /api/events report: its events plus a heartbeat."""
-    instance_id = body.get("instance_id")
-    if not instance_id:
-        return None
-    events = body.get("events") or []
-    with connect() as conn, conn.cursor() as cur:
-        minutes = write_events(cur, instance_id, events)
-        heartbeat(
-            cur, instance_id, float(body.get("uptime_seconds") or 0),
-            body.get("queue_depth"), client_ip,
-        )
-        conn.commit()
-        cache_messages(cur, instance_id, minutes)
-    return len(events)
 
 
 def compute_stats(queue_depth=None):

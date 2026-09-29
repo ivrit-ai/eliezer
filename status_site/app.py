@@ -1,12 +1,10 @@
 import base64
-import json
 import logging
 import os
 import threading
 from contextlib import asynccontextmanager
 
-from fastapi import Depends, FastAPI, Request
-from fastapi.concurrency import run_in_threadpool
+from fastapi import Depends, FastAPI
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
@@ -111,30 +109,6 @@ app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None, lifespan=lifespan
 app.mount("/static", StaticFiles(directory=os.path.join(BASE_DIR, "static")), name="static")
 app.include_router(queue_api)
 app.include_router(webhooks)
-
-INGEST_TOKEN = os.environ.get("INGEST_TOKEN", "")
-
-
-@app.post("/api/events")
-async def ingest(request: Request):
-    """Events and heartbeats from edges that still report their own statistics."""
-    if not INGEST_TOKEN or request.headers.get("X-Ingest-Token") != INGEST_TOKEN:
-        return JSONResponse({"error": "unauthorized"}, status_code=401)
-
-    # Like Flask's get_json(silent=True): a body that isn't a JSON object reads as empty.
-    try:
-        body = json.loads(await request.body())
-    except ValueError:
-        body = None
-    if not isinstance(body, dict):
-        body = {}
-    # uvicorn runs with --proxy-headers, so this is the caller's address, not the proxy's.
-    client_ip = request.client.host if request.client else None
-    ingested = await run_in_threadpool(stats.ingest_events, body, client_ip)
-    if ingested is None:
-        return JSONResponse({"error": "instance_id required"}, status_code=400)
-    return {"ok": True, "ingested": ingested}
-
 
 @app.get("/api/stats")
 def api_stats():

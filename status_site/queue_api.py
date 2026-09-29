@@ -3,12 +3,9 @@
 Replaces the AWS SQS queue the edges used to poll. One table, one FOR UPDATE SKIP
 LOCKED statement, real visibility-timeout semantics. Webhooks (ingest.py) feed it.
 
-Edges speak one of two protocols, told apart by the X-Edge-Protocol header:
-- 1 (legacy): lease the raw message, handle it end to end - including replying on the
-  platform - and ack. Kept only until every edge runs protocol 2.
-- 2: lease a job, fetch its media through the hub (/queue/media), report the duration
-  (/queue/admit), and hand back the transcript (/queue/complete). The hub does all
-  platform I/O, limits, replies and statistics; edges hold no platform credentials.
+An edge leases a job, fetches its media through the hub (/queue/media), reports the
+duration (/queue/admit), and hands back the transcript (/queue/complete). The hub does
+all platform I/O, limits, replies and statistics; edges hold no platform credentials.
 
 Messages are never kept: a message not handled within QUEUE_MAX_AGE_SECONDS of being
 *sent* is dropped - at ingest if it already is that old, otherwise by the sweeper.
@@ -259,10 +256,6 @@ def require_edge(request: Request):
     return request.headers.get("X-Instance-Id") or "unknown"
 
 
-def _protocol(request):
-    return 2 if request.headers.get("X-Edge-Protocol") == "2" else 1
-
-
 async def _json_body(request):
     try:
         body = json.loads(await request.body())
@@ -271,14 +264,13 @@ async def _json_body(request):
     return body if isinstance(body, dict) else {}
 
 
-def _try_lease(n, min_depth, edge, sources=None):
+def _try_lease(n, min_depth, edge):
     with db.pool().connection() as conn, conn.cursor() as cur:
         if min_depth:
             cur.execute(f"SELECT count(*) AS n FROM queue_messages WHERE {LEASABLE};", _params())
             n = min(n, int(cur.fetchone()["n"]) - min_depth)
             if n <= 0:
                 return []
-        source_filter = "AND source = ANY(%(sources)s)" if sources else ""
         # MATERIALIZED is load-bearing: as a plain IN (SELECT ... LIMIT n) the planner is
         # free to run the pick as a per-row subplan, which re-applies the LIMIT on every
         # outer row and leases the whole queue instead of n.
@@ -286,7 +278,7 @@ def _try_lease(n, min_depth, edge, sources=None):
             f"""
             WITH picked AS MATERIALIZED (
               SELECT id FROM queue_messages
-              WHERE {LEASABLE} {source_filter}
+              WHERE {LEASABLE}
               ORDER BY id
               FOR UPDATE SKIP LOCKED
               LIMIT %(n)s
@@ -301,7 +293,7 @@ def _try_lease(n, min_depth, edge, sources=None):
             RETURNING q.id, q.source, q.body, q.receipt_handle, q.receive_count, q.job_id,
                       extract(epoch FROM q.sent_at)::float8 AS sent_at;
             """,
-            _params(n=n, vis=VISIBILITY_TIMEOUT, edge=edge, sources=sources),
+            _params(n=n, vis=VISIBILITY_TIMEOUT, edge=edge),
         )
         rows = cur.fetchall()
         conn.commit()
@@ -309,8 +301,8 @@ def _try_lease(n, min_depth, edge, sources=None):
 
 
 def _jobs_for(rows, edge, uptime, client_ip):
-    """Protocol 2: describe leased rows as jobs, record the edge's heartbeat, and count
-    each message once, on its first lease."""
+    """Describe leased rows as jobs, record the edge's heartbeat, and count each message
+    once, on its first lease."""
     jobs, events, after = [], [], []
     for r in rows:
         parsed = SOURCES[r["source"]].parse(r["body"])
@@ -341,9 +333,6 @@ async def lease(request: Request, edge: str = Depends(require_edge)):
     n = max(1, min(int(payload.get("max", 1)), MAX_BATCH))
     wait = max(0, min(int(payload.get("wait", 0)), MAX_WAIT_SECONDS))
     min_depth = max(0, int(payload.get("min_depth", 0)))
-    protocol = _protocol(request)
-    # Legacy edges only understand WhatsApp bodies, so never hand them anything else.
-    sources = None if protocol == 2 else ["whatsapp"]
 
     # Long poll without holding a thread: each attempt runs on the threadpool, and the
     # wait between attempts is an await, so idle edges cost nothing.
@@ -351,22 +340,13 @@ async def lease(request: Request, edge: str = Depends(require_edge)):
     backoff = 0.2
     rows = []
     while not _shutting_down.is_set():
-        rows = await run_in_threadpool(_try_lease, n, min_depth, edge, sources)
+        rows = await run_in_threadpool(_try_lease, n, min_depth, edge)
         if rows or time.monotonic() >= deadline:
             break
         await asyncio.sleep(min(backoff, max(0.0, deadline - time.monotonic())))
         backoff = min(backoff * 2.5, 1.0)
 
-    log.debug("lease edge=%s v%s max=%s wait=%s min_depth=%s -> %s",
-              edge, protocol, n, wait, min_depth, len(rows))
-    if protocol == 1:
-        return {
-            "messages": [
-                {"handle": r["receipt_handle"], "source": r["source"], "body": r["body"],
-                 "sent_at": r["sent_at"]}
-                for r in rows
-            ]
-        }
+    log.debug("lease edge=%s max=%s wait=%s min_depth=%s -> %s", edge, n, wait, min_depth, len(rows))
     client_ip = request.client.host if request.client else None
     uptime = float(payload.get("uptime_seconds") or 0)
     jobs = await run_in_threadpool(_jobs_for, rows, edge, uptime, client_ip)
@@ -539,26 +519,6 @@ async def complete(request: Request, edge: str = Depends(require_edge)):
     if not done:
         raise HTTPException(status_code=409, detail="lease no longer held")
     log.debug("complete edge=%s handle=%s error=%s", edge, handle, error)
-    return {"ok": True}
-
-
-def _ack(handle):
-    with db.pool().connection() as conn, conn.cursor() as cur:
-        cur.execute("DELETE FROM queue_messages WHERE receipt_handle = %s;", (handle,))
-        deleted = cur.rowcount
-        conn.commit()
-    return deleted
-
-
-@queue_api.post("/queue/ack")
-async def ack(request: Request, edge: str = Depends(require_edge)):
-    """Protocol 1 only: the edge handled the message itself."""
-    payload = await _json_body(request)
-    handle = payload.get("handle")
-    if not handle:
-        raise HTTPException(status_code=400, detail="handle required")
-    deleted = await run_in_threadpool(_ack, handle)
-    log.debug("ack edge=%s handle=%s deleted=%s", edge, handle, deleted)
     return {"ok": True}
 
 
