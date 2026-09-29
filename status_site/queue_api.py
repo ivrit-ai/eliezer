@@ -20,6 +20,7 @@ import signal
 import threading
 import time
 
+import httpx
 import psycopg
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.concurrency import run_in_threadpool
@@ -383,16 +384,37 @@ def _media_ref(handle):
     return row["source"], parsed["media"]
 
 
+MEDIA_ATTEMPTS = 3
+MEDIA_RETRY_SECONDS = 1.0
+
+
+def _transient(e):
+    """A failure worth retrying: the network, or the platform's 5xx/429."""
+    if isinstance(e, httpx.TransportError):
+        return True
+    if isinstance(e, httpx.HTTPStatusError):
+        return e.response.status_code >= 500 or e.response.status_code == 429
+    return False
+
+
 @queue_api.get("/queue/media/{handle}")
 async def media(handle: str, edge: str = Depends(require_edge)):
     source, ref = await run_in_threadpool(_media_ref, handle)
     if ref is None:
         raise HTTPException(status_code=404, detail="no such lease")
-    try:
-        response, content_type = await SOURCES[source].open_media(ref)
-    except Exception as e:
-        log.warning("media for lease %s (%s) unavailable: %s", handle, source, e)
-        raise HTTPException(status_code=502, detail="media unavailable")
+    for attempt in range(MEDIA_ATTEMPTS):
+        try:
+            response, content_type = await SOURCES[source].open_media(ref)
+            break
+        except Exception as e:
+            # A platform's media API sometimes fails for a moment; without a retry here
+            # the job would wait out its lease before anyone tried again.
+            if attempt < MEDIA_ATTEMPTS - 1 and _transient(e):
+                log.debug("media for lease %s (%s) failed, retrying: %s", handle, source, e)
+                await asyncio.sleep(MEDIA_RETRY_SECONDS * (attempt + 1))
+                continue
+            log.warning("media for lease %s (%s) unavailable: %s", handle, source, e)
+            raise HTTPException(status_code=502, detail="media unavailable")
     return StreamingResponse(
         response.aiter_bytes(), media_type=content_type, background=BackgroundTask(response.aclose)
     )
@@ -480,7 +502,7 @@ def _complete(handle, text, error, transcription_seconds, duration, edge):
             notice = messages.WA_PRICING_NOTICE if transcribed and target["channel"] == "whatsapp" else None
             outbox.enqueue_text(
                 cur, target, reply, row["sent_at"], extra=[notice, nudge],
-                source_handle=handle if i == 0 else f"{handle}#{i}",
+                source_handle=handle if i == 0 else f"{handle}#{i}", transcript=transcribed,
             )
         minutes = []
         if transcribed:
@@ -522,6 +544,36 @@ async def complete(request: Request, edge: str = Depends(require_edge)):
     if not done:
         raise HTTPException(status_code=409, detail="lease no longer held")
     log.debug("complete edge=%s handle=%s error=%s", edge, handle, error)
+    return {"ok": True}
+
+
+# How soon a released job may be leased again: soon, but not in a tight loop if whatever
+# made it fail is still happening. Each retry still counts toward MAX_RECEIVES.
+RELEASE_DELAY_SECONDS = 10
+
+
+def _release(handle):
+    with db.pool().connection() as conn, conn.cursor() as cur:
+        cur.execute(
+            "UPDATE queue_messages SET visible_at = now() + make_interval(secs => %s::double precision) "
+            "WHERE receipt_handle = %s;",
+            (RELEASE_DELAY_SECONDS, handle),
+        )
+        released = cur.rowcount
+        conn.commit()
+    return released
+
+
+@queue_api.post("/queue/release")
+async def release(request: Request, edge: str = Depends(require_edge)):
+    """An edge failed on a job (download, conversion, transcription backend): make it
+    available again now, rather than when its lease would have lapsed."""
+    payload = await _json_body(request)
+    handle = payload.get("handle")
+    if not handle:
+        raise HTTPException(status_code=400, detail="handle required")
+    released = await run_in_threadpool(_release, handle)
+    log.debug("release edge=%s handle=%s released=%s", edge, handle, released)
     return {"ok": True}
 
 

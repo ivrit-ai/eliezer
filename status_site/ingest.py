@@ -112,14 +112,10 @@ def _route(source, items):
             user_key = parsed["user_key"]
 
             if source == "whatsapp" and not limits.is_allowed_region(parsed["sender"]):
-                # Allowlisted numbers are an admin's call; everyone else is refused -
-                # on WhatsApp, and so only while WhatsApp replies are on at all.
+                # Outside the served regions: ignored (a refusal would be a billed
+                # WhatsApp message). Allowlisted numbers are an admin's call.
                 if identity.user_of(cur, "whatsapp", parsed["sender"]) is None:
-                    if identity.policy(cur) == "reply":
-                        outbox.enqueue_text(cur, default, messages.REJECTED_REGION, sent_at)
-                        counts["answered"] += 1
-                    else:
-                        counts["unlinked"] += 1
+                    counts["ignored"] += 1
                     continue
 
             text = parsed["text"]

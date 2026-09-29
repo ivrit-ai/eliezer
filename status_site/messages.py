@@ -3,7 +3,6 @@
 import os
 import random
 
-REJECTED_REGION = "מצטערים, השירות זמין רק כרגע למספרי טלפון מישראל, אירופה וצפון אמריקה."
 ONLY_RECORDINGS = "נכון להיום אני יודע לתמלל הקלטות, לא מעבר לזה."
 DURATION_FAILED = "אירעה שגיאה בבדיקת אורך הקובץ."
 TOO_LONG = "אני מתנצל, אך קיבלתי הנחיה שלא לתמלל קבצים שארוכים מ-10 דקות."
@@ -61,7 +60,6 @@ def tg_already_linked(masked_numbers):
 
 
 TG_LINK_EXPIRED = "תוקף קוד הקישור פג. שלחו /link לקבלת קוד חדש."
-WA_LINK_UNKNOWN = "קוד הקישור לא תקין. שלחו /link לבוט בטלגרם כדי לקבל קוד חדש."
 
 
 def tg_moved_away(masked):

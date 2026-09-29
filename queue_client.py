@@ -74,8 +74,14 @@ class QueueClient:
                     f.write(chunk)
 
     def admit(self, handle, duration):
-        """Whether to transcribe. On False the site has already told the user why."""
+        """Whether to transcribe. On False the site has closed the job (and told the user
+        why, on channels where that costs nothing)."""
         return self._post("/queue/admit", {"handle": handle, "duration": duration})["ok"]
+
+    def release(self, handle):
+        """Give back a job this edge failed on, so it is retried soon instead of when the
+        lease would lapse."""
+        self._post("/queue/release", {"handle": handle}, retries=1)
 
     def complete(self, handle, text=None, error=None, transcription_seconds=None, duration=None):
         """Hand back the transcript (or the reason there is none); the site replies."""

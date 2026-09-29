@@ -71,10 +71,17 @@ def split_text(channel, text, quote):
     ]
 
 
-def enqueue_text(cur, target, text, sent_at, extra=(), source_handle=None, buttons=None):
+def enqueue_text(cur, target, text, sent_at, extra=(), source_handle=None, buttons=None,
+                 transcript=False):
     """Queue a reply to target, in the caller's transaction. extra are further messages
     sent after it, unquoted (the nudge); buttons are links shown under the reply, where
-    the channel supports them. sent_at is when the user sent what this answers."""
+    the channel supports them. sent_at is when the user sent what this answers.
+
+    WhatsApp bills every message, so it gets transcripts (transcript=True) and nothing
+    else: notices, refusals and command answers are dropped there, and still go out on
+    every other channel."""
+    if target["channel"] == "whatsapp" and not transcript:
+        return
     parts = split_text(target["channel"], text, target.get("quote"))
     if buttons:
         parts[-1]["buttons"] = buttons

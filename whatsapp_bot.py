@@ -342,9 +342,14 @@ class WhatsAppBot:
                 try:
                     self.process_job(job)
                 except Exception as e:
-                    # Not completed: the lease lapses and the job is retried, on this
-                    # edge or another, up to the site's receive limit.
+                    # Not completed: hand it back so it is retried shortly, on this edge
+                    # or another, up to the site's receive limit. If even that fails,
+                    # the lease lapses and it is retried then.
                     self.logger.error(f"Error processing job: {str(e)}")
+                    try:
+                        self.queue.release(job['handle'])
+                    except Exception as release_error:
+                        self.logger.debug(f"Could not release job: {release_error}")
                 finally:
                     self.job_queue.task_done()
 

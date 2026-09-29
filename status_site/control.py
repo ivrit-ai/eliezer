@@ -27,10 +27,6 @@ def _tg(chat_id, quote=None):
     return {"channel": "telegram", "address": str(chat_id), "quote": quote}
 
 
-def _wa(number, quote=None):
-    return {"channel": "whatsapp", "address": str(number), "quote": quote}
-
-
 def _numbers(cur, user_id):
     return [i["address"] for i in identity.identities_of(cur, user_id) if i["channel"] == "whatsapp"]
 
@@ -61,22 +57,15 @@ def is_whatsapp_link(text):
 
 
 def handle_whatsapp_link(cur, parsed, sent_at):
+    """"link <code>" from WhatsApp. Outcomes are reported in Telegram, where the code
+    came from; a wrong code gets no answer, since any WhatsApp reply is billed."""
     number = parsed["sender"]
-    user = identity.user_of(cur, "whatsapp", number)
-    can_reply = identity.wa_permitted(cur, user)
-    here = _wa(number, parsed["message_id"])
     status, user_id = identity.consume_token(cur, LINK_WITH_CODE.match(parsed["text"]).group(1))
-    if status == "ok" and not limits.is_allowed_region(number):
-        if can_reply:
-            outbox.enqueue_text(cur, here, messages.REJECTED_REGION, sent_at)
-        return
-    if status == "ok":
+    if status == "ok" and limits.is_allowed_region(number):
         _link_whatsapp(cur, user_id, number, sent_at)
     elif status == "expired":
         for chat in _chats(cur, user_id):
             outbox.enqueue_text(cur, _tg(chat), messages.TG_LINK_EXPIRED, sent_at)
-    elif can_reply:
-        outbox.enqueue_text(cur, here, messages.WA_LINK_UNKNOWN, sent_at)
 
 
 # --- Telegram
