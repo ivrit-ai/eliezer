@@ -1,12 +1,10 @@
 """The control plane: commands, linking and admin, answered by the hub itself.
 
-Linking always ends with WhatsApp numbers joining the Telegram chat's user and stopping
-WhatsApp replies (the linked channel replaces WhatsApp). It works from either side:
-- Telegram first: /link gives a wa.me button whose prefilled text is "link <code>";
-  sending it from WhatsApp links that number.
-- WhatsApp first (only while WhatsApp replies are allowed): "link" gets a t.me link
-  whose Start button sends "/start <code>" to the bot, linking that chat.
-Codes are single-use and expire after 15 minutes.
+Linking starts in Telegram and ends with WhatsApp numbers joining the Telegram chat's
+user and stopping WhatsApp replies (the linked channel replaces WhatsApp): /link gives a
+wa.me button whose prefilled text is "link <code>", and sending that from WhatsApp links
+the number. There is no way to start from WhatsApp, where every reply costs. Codes are
+single-use and expire after 15 minutes.
 """
 
 import os
@@ -18,13 +16,11 @@ import messages
 import outbox
 import queue_api
 import stats
-import telegram
 import whatsapp
 
 ADMIN_CHAT_IDS = {c.strip() for c in os.environ.get("ADMIN_TG_CHAT_IDS", "").split(",") if c.strip()}
 
 LINK_WITH_CODE = re.compile(r"^\s*link\s+([0-9a-z]{8})\s*$", re.IGNORECASE)
-BARE_LINK = re.compile(r"^\s*link\s*$", re.IGNORECASE)
 
 
 def _tg(chat_id, quote=None):
@@ -61,7 +57,7 @@ def _link_whatsapp(cur, user_id, number, sent_at):
 # --- WhatsApp
 
 def is_whatsapp_link(text):
-    return bool(text and (LINK_WITH_CODE.match(text) or BARE_LINK.match(text)))
+    return bool(text and LINK_WITH_CODE.match(text))
 
 
 def handle_whatsapp_link(cur, parsed, sent_at):
@@ -69,19 +65,7 @@ def handle_whatsapp_link(cur, parsed, sent_at):
     user = identity.user_of(cur, "whatsapp", number)
     can_reply = identity.wa_permitted(cur, user)
     here = _wa(number, parsed["message_id"])
-    match = LINK_WITH_CODE.match(parsed["text"])
-
-    if match is None:
-        # "link" alone: offer the Telegram side, if we may answer on WhatsApp at all.
-        if not can_reply or not telegram.username():
-            return
-        user_id = identity.ensure_user(cur, "whatsapp", number, deliver=True)
-        token = identity.mint_token(cur, user_id)
-        url = f"https://t.me/{telegram.username()}?start={token}"
-        outbox.enqueue_text(cur, here, messages.wa_link_offer(url), sent_at)
-        return
-
-    status, user_id = identity.consume_token(cur, match.group(1))
+    status, user_id = identity.consume_token(cur, LINK_WITH_CODE.match(parsed["text"]).group(1))
     if status == "ok" and not limits.is_allowed_region(number):
         if can_reply:
             outbox.enqueue_text(cur, here, messages.REJECTED_REGION, sent_at)
@@ -121,17 +105,6 @@ def handle_telegram_text(cur, parsed, sent_at):
     if command in ADMIN_COMMANDS and chat in ADMIN_CHAT_IDS:
         outbox.enqueue_text(cur, here, ADMIN_COMMANDS[command](cur, arg), sent_at)
         return
-    if command == "/start" and arg:
-        status, token_user = identity.consume_token(cur, arg)
-        if status == "ok":
-            user_id = identity.ensure_user(cur, "telegram", chat, deliver=True)
-            for number in _numbers(cur, token_user):
-                _link_whatsapp(cur, user_id, number, sent_at)
-            return
-        if status == "expired":
-            outbox.enqueue_text(cur, here, messages.TG_LINK_EXPIRED, sent_at)
-            return
-        # An unknown code: treat it as a plain /start.
     if command == "/unlink":
         user = identity.user_of(cur, "telegram", chat)
         numbers = _numbers(cur, user["id"]) if user else []

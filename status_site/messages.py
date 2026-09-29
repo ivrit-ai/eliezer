@@ -64,10 +64,6 @@ TG_LINK_EXPIRED = "תוקף קוד הקישור פג. שלחו /link לקבלת 
 WA_LINK_UNKNOWN = "קוד הקישור לא תקין. שלחו /link לבוט בטלגרם כדי לקבל קוד חדש."
 
 
-def wa_link_offer(url):
-    return f"כדי לקבל את התמלולים בטלגרם, פתחו את הקישור ולחצו על Start:\n{url}"
-
-
 def tg_moved_away(masked):
     return f"המספר {masked} קושר לצ'אט טלגרם אחר, והתמלולים שלו לא יגיעו לכאן יותר."
 
