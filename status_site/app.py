@@ -1,4 +1,5 @@
 import base64
+import json
 import os
 import random
 import threading
@@ -8,7 +9,10 @@ from datetime import datetime, timezone
 
 import psycopg
 from psycopg.rows import dict_row
-from flask import Flask, Response, jsonify, render_template, request
+from fastapi import FastAPI, Request
+from fastapi.concurrency import run_in_threadpool
+from fastapi.responses import FileResponse, JSONResponse, Response
+from fastapi.staticfiles import StaticFiles
 
 # 32x32 ivrit.ai favicon (PNG), embedded so it can be served without a binary asset.
 FAVICON_PNG = base64.b64decode(
@@ -36,7 +40,12 @@ FAVICON_PNG = base64.b64decode(
     "yf/Gfn489swlzwAAAABJRU5ErkJggg=="
 )
 
-app = Flask(__name__)
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# No generated docs: the Flask app exposed exactly these routes, and the queue/webhook
+# endpoints coming next are not meant to be browsable.
+app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
+app.mount("/static", StaticFiles(directory=os.path.join(BASE_DIR, "static")), name="static")
 
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
 INGEST_TOKEN = os.environ.get("INGEST_TOKEN", "")
@@ -49,7 +58,8 @@ EVENT_RETENTION_SECONDS = 25 * 3600
 # without re-aggregating the events table on every poll. Keyed by minute-bucket epoch
 # (int seconds, floored to the minute) -> {instance_id: count}. The single site process
 # is the sole writer for all instances' ingests, so this stays consistent across the
-# fleet. waitress is multithreaded, so every access is guarded by _series_lock.
+# fleet. Sync handlers run on FastAPI's threadpool, so every access is guarded by
+# _series_lock. This is also why the site must run as a single uvicorn worker.
 SERIES_MINUTES = 60  # 1h graph: 60 one-minute buckets, kept in-process
 # The weekly graph needs hourly buckets going back further than events are retained, so
 # those are persisted in the msg_hourly table (see init_db) and queried per poll (168 rows).
@@ -176,14 +186,25 @@ def _event_ts(raw):
 
 
 @app.post("/api/events")
-def ingest():
+async def ingest(request: Request):
     if not INGEST_TOKEN or request.headers.get("X-Ingest-Token") != INGEST_TOKEN:
-        return jsonify({"error": "unauthorized"}), 401
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
 
-    body = request.get_json(silent=True) or {}
+    # Like Flask's get_json(silent=True): a body that isn't a JSON object reads as empty.
+    try:
+        body = json.loads(await request.body())
+    except ValueError:
+        body = None
+    if not isinstance(body, dict):
+        body = {}
+    # The DB work is synchronous; run it off the event loop.
+    return await run_in_threadpool(_ingest, body)
+
+
+def _ingest(body):
     instance_id = body.get("instance_id")
     if not instance_id:
-        return jsonify({"error": "instance_id required"}), 400
+        return JSONResponse({"error": "instance_id required"}, status_code=400)
 
     uptime_seconds = float(body.get("uptime_seconds") or 0)
     queue_depth = body.get("queue_depth")
@@ -268,7 +289,7 @@ def ingest():
                 for m in message_minutes:
                     _series_counts[m][instance_id] += 1
 
-    return jsonify({"ok": True, "ingested": len(events)})
+    return {"ok": True, "ingested": len(events)}
 
 
 @app.get("/api/stats")
@@ -378,7 +399,7 @@ def stats():
             latest_queue_depth = inst["queue_depth"]
             break
 
-    return jsonify(
+    return JSONResponse(
         {
             "totals": {
                 "messages": totals["messages"],
@@ -418,16 +439,20 @@ def stats():
     )
 
 
-@app.get("/favicon.ico")
+# HEAD is listed explicitly: Flask answered it on every GET route, Starlette does not.
+@app.api_route("/favicon.ico", methods=["GET", "HEAD"])
 def favicon():
-    return Response(FAVICON_PNG, mimetype="image/png")
+    return Response(FAVICON_PNG, media_type="image/png")
 
 
-@app.get("/")
+@app.api_route("/", methods=["GET", "HEAD"])
 def index():
-    return render_template("index.html")
+    # The page is static HTML that fetches /api/stats client-side; nothing to render.
+    return FileResponse(os.path.join(BASE_DIR, "templates", "index.html"))
 
 
 if __name__ == "__main__":
+    import uvicorn
+
     init_db()
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "8000")))
+    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", "8000")))
