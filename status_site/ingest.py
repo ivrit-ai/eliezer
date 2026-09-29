@@ -1,78 +1,44 @@
-"""Platform webhooks: verify each delivery, split it into messages, and queue them."""
+"""Platform webhooks: verify each delivery, then route every message in it.
 
-import hashlib
-import hmac
+Media goes to the queue for an edge to transcribe. Everything else - commands, stray
+text, other message types, refusals - the hub answers itself through the outbox, so an
+edge only ever sees work that needs a GPU.
+"""
+
 import json
 import logging
-import os
 import time
+import uuid
 
 from fastapi import APIRouter, Request
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse, PlainTextResponse
 
+import analytics
+import db
+import limits
+import messages
+import outbox
 import queue_api
+import stats
+import whatsapp
 
 log = logging.getLogger(__name__)
 
-META_APP_SECRET = os.environ.get("META_APP_SECRET", "")
-META_VERIFY_TOKEN = os.environ.get("META_VERIFY_TOKEN", "")
+# Messages the hub handled itself are attributed to this instance in the statistics.
+HUB = "hub"
+
+SOURCES = {"whatsapp": whatsapp}
 
 webhooks = APIRouter()
 
 
-class WhatsAppWebhook:
-    def verify_registration(self, args):
-        if args.get("hub.mode") != "subscribe":
-            return None
-        token = args.get("hub.verify_token") or ""
-        if not META_VERIFY_TOKEN or not hmac.compare_digest(token, META_VERIFY_TOKEN):
-            return None
-        return args.get("hub.challenge")
-
-    def verify_payload(self, raw, headers):
-        received = headers.get("X-Hub-Signature-256", "")
-        if not META_APP_SECRET or not received.startswith("sha256="):
-            return False
-        expected = hmac.new(META_APP_SECRET.encode(), raw, hashlib.sha256).hexdigest()
-        return hmac.compare_digest(received[len("sha256="):], expected)
-
-    def split(self, payload):
-        """Yield (message_id, sent_at, body) per message. Meta may batch several messages
-        into one delivery; each becomes its own queue row, shaped as a single-message
-        webhook so the edge reads it exactly as before. Status updates (sent/delivered/
-        read receipts for our own replies) carry no message and are skipped."""
-        for entry in payload.get("entry") or []:
-            for change in entry.get("changes") or []:
-                value = change.get("value") or {}
-                context = {k: v for k, v in value.items() if k not in ("messages", "statuses")}
-                for message in value.get("messages") or []:
-                    body = {
-                        "object": payload.get("object"),
-                        "entry": [{
-                            "id": entry.get("id"),
-                            "changes": [{
-                                "field": change.get("field"),
-                                "value": {**context, "messages": [message]},
-                            }],
-                        }],
-                    }
-                    try:
-                        sent_at = float(message["timestamp"])
-                    except (KeyError, TypeError, ValueError):
-                        sent_at = time.time()
-                    yield message.get("id") or "", sent_at, json.dumps(body)
-
-
-SOURCES = {"whatsapp": WhatsAppWebhook()}
-
-
 @webhooks.get("/webhook/{source}")
 def webhook_verify(source: str, request: Request):
-    handler = SOURCES.get(source)
-    if handler is None:
+    adapter = SOURCES.get(source)
+    if adapter is None:
         return JSONResponse({"error": "unknown source"}, status_code=404)
-    challenge = handler.verify_registration(request.query_params)
+    challenge = adapter.verify_registration(request.query_params)
     if challenge is None:
         log.warning("webhook %s registration rejected: bad mode or verify token", source)
         return JSONResponse({"error": "forbidden"}, status_code=403)
@@ -82,12 +48,12 @@ def webhook_verify(source: str, request: Request):
 
 @webhooks.post("/webhook/{source}")
 async def webhook_receive(source: str, request: Request):
-    handler = SOURCES.get(source)
-    if handler is None:
+    adapter = SOURCES.get(source)
+    if adapter is None:
         return JSONResponse({"error": "unknown source"}, status_code=404)
-    # The signature covers the exact bytes Meta sent, so verify before parsing.
+    # The signature covers the exact bytes the platform sent, so verify before parsing.
     raw = await request.body()
-    if not handler.verify_payload(raw, request.headers):
+    if not adapter.verify_payload(raw, request.headers):
         log.warning(
             "webhook %s REJECTED: signature mismatch (%s bytes) - check META_APP_SECRET",
             source, len(raw),
@@ -100,12 +66,67 @@ async def webhook_receive(source: str, request: Request):
         log.warning("webhook %s: signed payload is not JSON (%s bytes)", source, len(raw))
         return {"ok": True}
 
-    items = list(handler.split(payload))
     # A DB failure raises and returns 500, so the platform retries; the dedup table
     # makes that retry safe.
-    queued, duplicates, stale = await run_in_threadpool(queue_api.ingest, source, items)
-    log.debug(
-        "webhook %s: %s message(s) -> queued %s, duplicate %s, stale %s",
-        source, len(items), queued, duplicates, stale,
-    )
+    summary = await run_in_threadpool(_route, source, list(adapter.split(payload)))
+    log.debug("webhook %s: %s", source, summary)
     return {"ok": True}
+
+
+def _route(source, items):
+    """Handle one delivery's messages in a single transaction: all of it lands, or
+    none of it and the platform retries."""
+    adapter = SOURCES[source]
+    counts = {"queued": 0, "answered": 0, "ignored": 0, "duplicate": 0, "stale": 0}
+    events, after = [], []
+    with db.pool().connection() as conn, conn.cursor() as cur:
+        for message_id, sent_at, body in items:
+            if queue_api.is_stale(sent_at):
+                counts["stale"] += 1
+                continue
+            if not queue_api.first_delivery(cur, source, message_id):
+                counts["duplicate"] += 1
+                continue
+            parsed = adapter.parse(body)
+            target = adapter.target(parsed)
+            user = parsed["sender"]
+
+            if source == "whatsapp" and not limits.is_allowed_region(user):
+                outbox.enqueue_text(cur, target, messages.REJECTED_REGION, sent_at)
+                counts["answered"] += 1
+                continue
+
+            job_id = str(uuid.uuid4())
+            if parsed["kind"]:
+                # Counted when an edge first leases it, like the edges always did.
+                queue_api.enqueue(cur, source, body, sent_at, job_id)
+                outbox.enqueue_receipt(cur, target, typing=False, sent_at=sent_at)
+                counts["queued"] += 1
+                continue
+
+            events.append({"kind": "message", "ts": time.time(), "message_type": parsed["type"],
+                           "user_hash": stats.user_hash(user)})
+            after.append((user, {"user": user, "type": parsed["type"], "job_id": job_id}))
+            if parsed["type"] != "text":
+                # Stickers, images, reactions...: counted, otherwise left alone.
+                counts["ignored"] += 1
+                continue
+            outbox.enqueue_receipt(cur, target, typing=False, sent_at=sent_at)
+            outbox.enqueue_text(cur, target, _answer(parsed["text"]), sent_at)
+            counts["answered"] += 1
+
+        queue_api.count_dropped(cur, counts["stale"])
+        minutes = stats.write_events(cur, HUB, events)
+        conn.commit()
+        stats.cache_messages(cur, HUB, minutes)
+    for user, props in after:
+        analytics.capture(user, "message-received", props, HUB)
+    return counts
+
+
+def _answer(text):
+    if text == "/status":
+        return messages.status_text(stats.compute_stats(queue_api.queue_depth()))
+    if text == "/detailed-status":
+        return messages.detailed_status_text(stats.compute_stats(queue_api.queue_depth()))
+    return messages.ONLY_RECORDINGS

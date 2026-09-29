@@ -2,24 +2,21 @@ import base64
 import json
 import logging
 import os
-import random
-import threading
-import time
-from collections import defaultdict
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
 
-import psycopg
-from psycopg.rows import dict_row
 from fastapi import Depends, FastAPI, Request
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
+import outbox
+import stats
+import whatsapp
 from ingest import webhooks
 from queue_api import (
-    init_queue_db, install_shutdown_hook, queue_api, require_edge, start_sweeper,
+    init_queue_db, install_shutdown_hook, queue_api, queue_depth, require_edge, start_sweeper,
 )
+from stats import init_db, reset_db  # noqa: F401 - launch.sh calls app.init_db()
 
 # 32x32 ivrit.ai favicon (PNG), embedded so it can be served without a binary asset.
 FAVICON_PNG = base64.b64decode(
@@ -54,16 +51,31 @@ logging.basicConfig(
     level=os.environ.get("LOG_LEVEL", "INFO").upper(),
     format="%(asctime)s %(levelname)s %(name)s - %(message)s",
 )
+# httpx logs every request at INFO - one line per voice note fetched, media URL included.
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
+REQUIRED_SETTINGS = (
+    "QUEUE_TOKEN", "META_APP_SECRET", "META_VERIFY_TOKEN", "WHATSAPP_API_TOKEN",
+    "WHATSAPP_PHONE_NUMBER_ID", "STATUS_USER_SALT", "POSTHOG_API_KEY",
+)
+
+
 @asynccontextmanager
 async def lifespan(app):
+    missing = [k for k in REQUIRED_SETTINGS if not os.environ.get(k)]
+    if missing:
+        # Say so once, loudly, rather than failing quietly on every message.
+        logging.getLogger(__name__).warning("missing settings: %s", ", ".join(missing))
     install_shutdown_hook()
     stop_sweeper = start_sweeper()
+    stop_senders = outbox.start_senders()
     yield
+    stop_senders.set()
     stop_sweeper.set()
+    await whatsapp.close()
 
 
 # No generated docs: the queue and webhook endpoints are not meant to be browsable.
@@ -72,149 +84,12 @@ app.mount("/static", StaticFiles(directory=os.path.join(BASE_DIR, "static")), na
 app.include_router(queue_api)
 app.include_router(webhooks)
 
-DATABASE_URL = os.environ.get("DATABASE_URL", "")
 INGEST_TOKEN = os.environ.get("INGEST_TOKEN", "")
-STALE_SECONDS = int(os.environ.get("STALE_SECONDS", "90"))
-
-# Events older than this are pruned; long enough to cover the 24h window with margin.
-EVENT_RETENTION_SECONDS = 25 * 3600
-
-# In-process per-minute message-count cache, so /api/stats can serve the 1h graph
-# without re-aggregating the events table on every poll. Keyed by minute-bucket epoch
-# (int seconds, floored to the minute) -> {instance_id: count}. The single site process
-# is the sole writer for all instances' ingests, so this stays consistent across the
-# fleet. Sync handlers run on FastAPI's threadpool, so every access is guarded by
-# _series_lock. This is also why the site must run as a single uvicorn worker.
-SERIES_MINUTES = 60  # 1h graph: 60 one-minute buckets, kept in-process
-# The weekly graph needs hourly buckets going back further than events are retained, so
-# those are persisted in the msg_hourly table (see init_db) and queried per poll (168 rows).
-WEEK_HOURS = 7 * 24  # 1-week graph: 168 one-hour buckets
-
-_series_lock = threading.Lock()
-_series_counts = defaultdict(lambda: defaultdict(int))
-_series_loaded = False
-
-
-def _minute_epoch(ts):
-    """Floor a datetime to its minute as an int epoch (seconds)."""
-    return int(ts.timestamp()) // 60 * 60
-
-
-def _ensure_series_loaded(cur):
-    """One-time backfill of the cache from the DB (cold start / process restart)."""
-    global _series_loaded
-    if _series_loaded:
-        return
-    cur.execute(
-        """
-        SELECT instance_id,
-               extract(epoch FROM date_trunc('minute', ts))::bigint AS m,
-               count(*) AS cnt
-        FROM events
-        WHERE kind = 'message' AND ts > now() - make_interval(mins => %s)
-        GROUP BY instance_id, date_trunc('minute', ts);
-        """,
-        (SERIES_MINUTES,),
-    )
-    for row in cur.fetchall():
-        _series_counts[int(row["m"])][row["instance_id"]] = int(row["cnt"])
-    _series_loaded = True
-
-
-def _prune_series(now_epoch):
-    cutoff = now_epoch - SERIES_MINUTES * 60
-    for m in [m for m in _series_counts if m < cutoff]:
-        del _series_counts[m]
-
-
-def connect():
-    return psycopg.connect(DATABASE_URL, row_factory=dict_row)
-
-
-def init_db():
-    with connect() as conn, conn.cursor() as cur:
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS totals (
-              id INT PRIMARY KEY DEFAULT 1,
-              messages BIGINT NOT NULL DEFAULT 0,
-              transcriptions BIGINT NOT NULL DEFAULT 0,
-              duration_seconds DOUBLE PRECISION NOT NULL DEFAULT 0,
-              CHECK (id = 1)
-            );
-            """
-        )
-        cur.execute("INSERT INTO totals (id) VALUES (1) ON CONFLICT DO NOTHING;")
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS events (
-              id BIGSERIAL PRIMARY KEY,
-              ts TIMESTAMPTZ NOT NULL,
-              instance_id TEXT NOT NULL,
-              kind TEXT NOT NULL,
-              duration_seconds DOUBLE PRECISION,
-              user_hash TEXT,
-              message_type TEXT
-            );
-            """
-        )
-        cur.execute("CREATE INDEX IF NOT EXISTS events_ts_idx ON events (ts);")
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS instances (
-              instance_id TEXT PRIMARY KEY,
-              last_seen TIMESTAMPTZ NOT NULL,
-              uptime_seconds DOUBLE PRECISION NOT NULL DEFAULT 0,
-              queue_depth INT
-            );
-            """
-        )
-        # Where each instance reports from, so an operator can find the machine behind
-        # an instance_id. Exposed only on the token-protected /queue/edges.
-        cur.execute("ALTER TABLE instances ADD COLUMN IF NOT EXISTS last_ip TEXT;")
-        # Persistent per-hour message counts for the weekly graph (events are pruned at
-        # 25h, so a week of history must live in its own aggregate, surviving restarts).
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS msg_hourly (
-              hour TIMESTAMPTZ NOT NULL,
-              instance_id TEXT NOT NULL,
-              cnt BIGINT NOT NULL DEFAULT 0,
-              PRIMARY KEY (hour, instance_id)
-            );
-            """
-        )
-        conn.commit()
-
-
-def reset_db():
-    """Wipe all stats back to zero. Gated behind the RESET_DB env flag in install.sh so it
-    only runs on an explicitly-flagged deploy (used to clear test data)."""
-    with connect() as conn, conn.cursor() as cur:
-        cur.execute("DELETE FROM events;")
-        cur.execute("DELETE FROM instances;")
-        cur.execute("DELETE FROM msg_hourly;")
-        cur.execute("UPDATE totals SET messages = 0, transcriptions = 0, duration_seconds = 0 WHERE id = 1;")
-        conn.commit()
-
-
-def _event_ts(raw):
-    """Accept a unix epoch (int/float) or ISO string; default to now."""
-    if raw is None:
-        return datetime.now(timezone.utc)
-    if isinstance(raw, (int, float)):
-        return datetime.fromtimestamp(raw, tz=timezone.utc)
-    try:
-        return datetime.fromtimestamp(float(raw), tz=timezone.utc)
-    except (TypeError, ValueError):
-        try:
-            return datetime.fromisoformat(raw)
-        except (TypeError, ValueError):
-            return datetime.now(timezone.utc)
 
 
 @app.post("/api/events")
 async def ingest(request: Request):
+    """Events and heartbeats from edges that still report their own statistics."""
     if not INGEST_TOKEN or request.headers.get("X-Ingest-Token") != INGEST_TOKEN:
         return JSONResponse({"error": "unauthorized"}, status_code=401)
 
@@ -225,261 +100,24 @@ async def ingest(request: Request):
         body = None
     if not isinstance(body, dict):
         body = {}
-    # The DB work is synchronous; run it off the event loop.
     # uvicorn runs with --proxy-headers, so this is the caller's address, not the proxy's.
     client_ip = request.client.host if request.client else None
-    return await run_in_threadpool(_ingest, body, client_ip)
-
-
-def _ingest(body, client_ip=None):
-    instance_id = body.get("instance_id")
-    if not instance_id:
+    ingested = await run_in_threadpool(stats.ingest_events, body, client_ip)
+    if ingested is None:
         return JSONResponse({"error": "instance_id required"}, status_code=400)
-
-    uptime_seconds = float(body.get("uptime_seconds") or 0)
-    queue_depth = body.get("queue_depth")
-    events = body.get("events") or []
-
-    messages_delta = 0
-    transcriptions_delta = 0
-    duration_delta = 0.0
-    message_minutes = []
-    hour_counts = defaultdict(int)
-
-    with connect() as conn, conn.cursor() as cur:
-        for ev in events:
-            kind = ev.get("kind")
-            if kind not in ("message", "transcription"):
-                continue
-            ts = _event_ts(ev.get("ts"))
-            duration = ev.get("duration_seconds")
-            cur.execute(
-                """
-                INSERT INTO events (ts, instance_id, kind, duration_seconds, user_hash, message_type)
-                VALUES (%s, %s, %s, %s, %s, %s);
-                """,
-                (ts, instance_id, kind, duration, ev.get("user_hash"), ev.get("message_type")),
-            )
-            if kind == "message":
-                messages_delta += 1
-                message_minutes.append(_minute_epoch(ts))
-                hour_counts[ts.replace(minute=0, second=0, microsecond=0)] += 1
-            else:
-                transcriptions_delta += 1
-                duration_delta += float(duration or 0)
-
-        for hour_dt, cnt in hour_counts.items():
-            cur.execute(
-                """
-                INSERT INTO msg_hourly (hour, instance_id, cnt)
-                VALUES (%s, %s, %s)
-                ON CONFLICT (hour, instance_id) DO UPDATE
-                  SET cnt = msg_hourly.cnt + EXCLUDED.cnt;
-                """,
-                (hour_dt, instance_id, cnt),
-            )
-
-        if messages_delta or transcriptions_delta or duration_delta:
-            cur.execute(
-                """
-                UPDATE totals
-                   SET messages = messages + %s,
-                       transcriptions = transcriptions + %s,
-                       duration_seconds = duration_seconds + %s
-                 WHERE id = 1;
-                """,
-                (messages_delta, transcriptions_delta, duration_delta),
-            )
-
-        cur.execute(
-            """
-            INSERT INTO instances (instance_id, last_seen, uptime_seconds, queue_depth, last_ip)
-            VALUES (%s, now(), %s, %s, %s)
-            ON CONFLICT (instance_id) DO UPDATE
-              SET last_seen = now(),
-                  uptime_seconds = EXCLUDED.uptime_seconds,
-                  queue_depth = EXCLUDED.queue_depth,
-                  last_ip = EXCLUDED.last_ip;
-            """,
-            (instance_id, uptime_seconds, queue_depth, client_ip),
-        )
-
-        # Opportunistic prune so events / hourly buckets don't grow without bound.
-        if random.random() < 0.02:
-            cur.execute(
-                "DELETE FROM events WHERE ts < now() - make_interval(secs => %s);",
-                (EVENT_RETENTION_SECONDS,),
-            )
-            cur.execute("DELETE FROM msg_hourly WHERE hour < now() - interval '8 days';")
-
-        conn.commit()
-
-        if message_minutes:
-            with _series_lock:
-                _ensure_series_loaded(cur)
-                for m in message_minutes:
-                    _series_counts[m][instance_id] += 1
-
-    return {"ok": True, "ingested": len(events)}
+    return {"ok": True, "ingested": ingested}
 
 
 @app.get("/api/stats")
-def stats():
-    with connect() as conn, conn.cursor() as cur:
-        cur.execute(
-            "SELECT messages, transcriptions, duration_seconds, dropped FROM totals WHERE id = 1;"
-        )
-        totals = cur.fetchone() or {
-            "messages": 0, "transcriptions": 0, "duration_seconds": 0, "dropped": 0,
-        }
-
-        cur.execute(
-            """
-            SELECT
-              count(*) FILTER (WHERE ts > now() - interval '1 minute')  AS m1,
-              count(*) FILTER (WHERE ts > now() - interval '5 minutes') AS m5,
-              count(*) FILTER (WHERE ts > now() - interval '1 hour')    AS m60,
-              count(*) FILTER (WHERE ts > now() - interval '24 hours')  AS m1440
-            FROM events
-            WHERE kind = 'message';
-            """
-        )
-        msg = cur.fetchone()
-
-        cur.execute(
-            """
-            SELECT
-              count(*) AS n,
-              avg(duration_seconds) AS avg_d,
-              percentile_cont(0.5)  WITHIN GROUP (ORDER BY duration_seconds) AS median_d,
-              percentile_cont(0.95) WITHIN GROUP (ORDER BY duration_seconds) AS p95_d
-            FROM events
-            WHERE kind = 'transcription' AND ts > now() - interval '1 hour';
-            """
-        )
-        tr = cur.fetchone()
-
-        cur.execute(
-            """
-            SELECT count(DISTINCT user_hash) AS u
-            FROM events
-            WHERE user_hash IS NOT NULL AND ts > now() - interval '24 hours';
-            """
-        )
-        unique_users_24h = cur.fetchone()["u"]
-
-        cur.execute(
-            """
-            SELECT instance_id, uptime_seconds, queue_depth,
-                   extract(epoch FROM (now() - last_seen)) AS age_seconds
-            FROM instances
-            WHERE last_seen > now() - make_interval(secs => %s)
-            ORDER BY instance_id;
-            """,
-            (STALE_SECONDS,),
-        )
-        instances = cur.fetchall()
-
-        # Per-minute message counts over the last hour, served from the in-process cache
-        # (zero-filled for a continuous x-axis). The cache is backfilled from the DB once
-        # on cold start and kept current by ingest, so no aggregation runs per poll.
-        with _series_lock:
-            _ensure_series_loaded(cur)
-            now_epoch = int(time.time()) // 60 * 60
-            _prune_series(now_epoch)
-            minutes = [now_epoch - (SERIES_MINUTES - 1 - i) * 60 for i in range(SERIES_MINUTES)]
-            minute_series = [
-                {"t": m, "count": sum(_series_counts.get(m, {}).values())}
-                for m in minutes
-            ]
-            minute_host_ids = sorted({iid for c in _series_counts.values() for iid in c})
-            minute_by_instance = [
-                {
-                    "instance_id": iid,
-                    "counts": [_series_counts.get(m, {}).get(iid, 0) for m in minutes],
-                }
-                for iid in minute_host_ids
-            ]
-
-        # Per-hour message counts over the last week, from the persistent msg_hourly
-        # aggregate (zero-filled to 168 buckets).
-        cur.execute(
-            """
-            SELECT instance_id, extract(epoch FROM hour)::bigint AS h, cnt
-            FROM msg_hourly
-            WHERE hour > now() - make_interval(hours => %s)
-            ORDER BY hour;
-            """,
-            (WEEK_HOURS,),
-        )
-        hour_rows = cur.fetchall()
-
-    now_hour = int(time.time()) // 3600 * 3600
-    hours = [now_hour - (WEEK_HOURS - 1 - i) * 3600 for i in range(WEEK_HOURS)]
-    per_host_hour = defaultdict(dict)
-    for row in hour_rows:
-        per_host_hour[row["instance_id"]][int(row["h"])] = int(row["cnt"])
-    week_series = [
-        {"t": h, "count": sum(hc.get(h, 0) for hc in per_host_hour.values())}
-        for h in hours
-    ]
-    week_by_instance = [
-        {"instance_id": iid, "counts": [per_host_hour[iid].get(h, 0) for h in hours]}
-        for iid in sorted(per_host_hour)
-    ]
-
-    latest_queue_depth = None
-    for inst in instances:
-        if inst["queue_depth"] is not None:
-            latest_queue_depth = inst["queue_depth"]
-            break
-
-    return JSONResponse(
-        {
-            "totals": {
-                "messages": totals["messages"],
-                "transcriptions": totals["transcriptions"],
-                "duration_seconds": totals["duration_seconds"],
-                "dropped": totals["dropped"],
-            },
-            "messages": {
-                "last_1m": msg["m1"],
-                "last_5m": msg["m5"],
-                "last_1h": msg["m60"],
-                "last_24h": msg["m1440"],
-                "per_min_1h": round((msg["m60"] or 0) / 60.0, 2),
-            },
-            "transcriptions_1h": {
-                "count": tr["n"],
-                "avg_duration": tr["avg_d"],
-                "median_duration": tr["median_d"],
-                "p95_duration": tr["p95_d"],
-            },
-            "unique_users_24h": unique_users_24h,
-            "queue_depth": latest_queue_depth,
-            "instances": [
-                {
-                    "instance_id": i["instance_id"],
-                    "uptime_seconds": i["uptime_seconds"],
-                    "age_seconds": round(float(i["age_seconds"]), 1),
-                }
-                for i in instances
-            ],
-            "live_instances": len(instances),
-            "messages_series_1h": minute_series,
-            "messages_series_1h_by_instance": minute_by_instance,
-            "messages_series_1w": week_series,
-            "messages_series_1w_by_instance": week_by_instance,
-            "generated_at": time.time(),
-        }
-    )
+def api_stats():
+    return JSONResponse(stats.compute_stats(queue_depth()))
 
 
 @app.get("/queue/edges")
 def edges(caller: str = Depends(require_edge)):
     """Every instance seen in the last day, with the address it reports from. Behind the
     queue token: which machines run the fleet is operator information, unlike /api/stats."""
-    with connect() as conn, conn.cursor() as cur:
+    with stats.connect() as conn, conn.cursor() as cur:
         cur.execute(
             """
             SELECT instance_id, last_ip, uptime_seconds,
@@ -519,4 +157,5 @@ if __name__ == "__main__":
     import uvicorn
 
     init_db()
+    init_queue_db()
     uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", "8000")))

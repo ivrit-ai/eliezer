@@ -1,45 +1,22 @@
-# WhatsApp Bot
+# Eliezer
 
-A simple bot that processes WhatsApp messages from a message queue and responds to them.
-The queue is the Eliezer Status site's (`status_site/`), which receives the WhatsApp
-webhook itself; AWS SQS remains supported only until every instance has moved over.
+Transcribes WhatsApp voice notes. Two parts:
 
-## Setup
+- **The status site** (`status_site/`, deployed as `eliezer-status` on xhostd) is the hub.
+  It receives the WhatsApp webhook, queues voice notes, answers everything that isn't a
+  transcription itself, and sends every reply. It holds all platform credentials and the
+  per-user limits, and serves the fleet dashboard at https://status.eliezer.ivrit.ai.
+- **Edges** (`whatsapp_bot.py`) only transcribe: they lease jobs from the hub, fetch the
+  audio through it, and hand back the text. Run as many as needed, anywhere.
 
-1. Install dependencies:
+## Running an edge
+
 ```bash
-pip install -r requirements.txt
+pip install -r requirements.txt   # plus ffmpeg/ffprobe on the PATH
+cp .env.example .env              # fill in the queue URL and token
+python whatsapp_bot.py --local    # faster-whisper on this machine's GPU
+python whatsapp_bot.py            # or transcribe on RunPod (needs RUNPOD_* in .env)
 ```
 
-2. Copy the environment template and fill in your values:
-```bash
-cp .env.example .env
-```
-
-3. Edit the `.env` file with your credentials:
-- `QUEUE_API_URL`: The status site's URL (unset: fall back to SQS via `APP_SQS_QUEUE`)
-- `QUEUE_TOKEN`: The site's `QUEUE_TOKEN`, shared by every instance
-- `WHATSAPP_API_TOKEN`: Your WhatsApp Business API token
-- `WHATSAPP_PHONE_NUMBER_ID`: Your WhatsApp phone number ID
-
-## Usage
-
-Run the bot:
-```bash
-python whatsapp_bot.py
-```
-
-The bot will:
-1. Lease messages from the queue
-2. Mark received messages as read
-3. Reply with a transcription of audio messages.
-4. Acknowledge processed messages, removing them from the queue
-
-## Error Handling
-
-The bot includes error handling for:
-- Queue connection issues
-- WhatsApp API errors
-- Message processing errors
-
-Errors are logged to the console but won't stop the bot from running.
+`--num-workers N` sets concurrent transcriptions (default 1 with `--local`, else 10).
+`--overflow-handler N` makes the edge take work only while more than N jobs are waiting.
