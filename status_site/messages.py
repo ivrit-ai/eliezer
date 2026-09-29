@@ -60,7 +60,6 @@ def tg_already_linked(masked_numbers):
     )
 
 
-WA_LINKED = "✅ המספר קושר לטלגרם. מעכשיו התמלולים יישלחו לשם."
 TG_LINK_EXPIRED = "תוקף קוד הקישור פג. שלחו /link לקבלת קוד חדש."
 WA_LINK_UNKNOWN = "קוד הקישור לא תקין. שלחו /link לבוט בטלגרם כדי לקבל קוד חדש."
 
@@ -82,7 +81,8 @@ TG_HELP = (
     "שלחו לי הקלטה ואתמלל אותה.\n\n"
     "/link – קישור לוואטסאפ: התמלולים של הקלטות מוואטסאפ יגיעו לכאן\n"
     "/unlink – ביטול הקישור\n"
-    "/status – סטטוס השירות"
+    "/status – סטטוס השירות\n\n"
+    "בקבוצה: הוסיפו אותי לקבוצה, והשיבו /transcribe להקלטה כדי לקבל את התמלול שלה."
 )
 
 # Appended to a transcript with probability 1/NUDGE_INTERVAL.

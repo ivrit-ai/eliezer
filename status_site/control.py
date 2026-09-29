@@ -52,11 +52,10 @@ def _link_whatsapp(cur, user_id, number, sent_at):
     masked = identity.mask("whatsapp", number)
     for chat in previous_chats:
         outbox.enqueue_text(cur, _tg(chat), messages.tg_moved_away(masked), sent_at)
+    # Confirmed on Telegram only: a WhatsApp message would cost, and the user is looking
+    # at Telegram anyway.
     for chat in _chats(cur, user_id):
         outbox.enqueue_text(cur, _tg(chat), messages.tg_linked(masked), sent_at)
-    user = identity.user_of(cur, "whatsapp", number)
-    if identity.wa_permitted(cur, user):
-        outbox.enqueue_text(cur, _wa(number), messages.WA_LINKED, sent_at)
 
 
 # --- WhatsApp

@@ -117,6 +117,12 @@ def _route(source, items):
                 counts["answered"] += 1
                 continue
 
+            if source == "telegram" and parsed.get("group") and not parsed["kind"]:
+                # In a group the bot transcribes audio and is otherwise silent: no
+                # commands, no linking, no answers to conversation.
+                counts["ignored"] += 1
+                continue
+
             if source == "telegram" and parsed["type"] == "text":
                 events.append(_message_event(parsed))
                 after.append((user_key, {"user": user_key, "type": "text", "job_id": str(uuid.uuid4())}))

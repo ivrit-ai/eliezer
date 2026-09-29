@@ -10,6 +10,7 @@ import hmac
 import json
 import logging
 import os
+import re
 import time
 
 import httpx
@@ -36,6 +37,7 @@ COMMANDS = [
     {"command": "link", "description": "קישור לוואטסאפ"},
     {"command": "unlink", "description": "ביטול הקישור לוואטסאפ"},
     {"command": "status", "description": "סטטוס השירות"},
+    {"command": "transcribe", "description": "בתשובה להקלטה: תמלול שלה"},
 ]
 
 _username = None
@@ -58,15 +60,39 @@ def verify_payload(raw, headers):
     return bool(WEBHOOK_SECRET) and hmac.compare_digest(received, WEBHOOK_SECRET)
 
 
+# Groups the bot is in: it transcribes audio posted there, replying to it, and otherwise
+# stays quiet. Automatic only with the bot's group privacy mode off in BotFather; with it
+# on, Telegram delivers only commands, so "/transcribe" as a reply to audio is the way in.
+GROUP_TYPES = ("group", "supergroup")
+TRANSCRIBE = re.compile(r"^/transcribe(@\w+)?$", re.IGNORECASE)
+
+MEDIA_FIELDS = (("voice", "audio"), ("audio", "audio"),
+                ("video_note", "document"), ("video", "document"), ("document", "document"))
+
+
 def split(update):
-    """Yield (update_id, sent_at, body) for the one update in a delivery: a private-chat
-    message, or a change in the bot's membership (the user blocked or restarted it)."""
+    """Yield (update_id, sent_at, body) for the one update in a delivery: a message in a
+    private chat or group, or a private chat's membership change (the user blocked or
+    restarted the bot). Being added to or removed from a group needs no action."""
     message = update.get("message")
     member = update.get("my_chat_member")
-    event = message or member
-    if not event or (event.get("chat") or {}).get("type") != "private":
+    if message:
+        if (message.get("chat") or {}).get("type") not in ("private",) + GROUP_TYPES:
+            return
+        event = message
+    elif member and (member.get("chat") or {}).get("type") == "private":
+        event = member
+    else:
         return
     yield str(update.get("update_id", "")), float(event.get("date") or time.time()), json.dumps(update)
+
+
+def _media_of(message):
+    for field, kind in MEDIA_FIELDS:
+        if field in message:
+            m = message[field]
+            return {"id": m.get("file_id"), "mime_type": m.get("mime_type"), "size": m.get("file_size")}, kind, field
+    return None, None, None
 
 
 def parse(body):
@@ -81,25 +107,32 @@ def parse(body):
                 "member_status": (member.get("new_chat_member") or {}).get("status")}
     message = body["message"]
     chat_id = str(message["chat"]["id"])
-    media, kind, mtype = None, None, "other"
-    for field, as_kind in (("voice", "audio"), ("audio", "audio"),
-                           ("video_note", "document"), ("video", "document"), ("document", "document")):
-        if field in message:
-            m = message[field]
-            media = {"id": m.get("file_id"), "mime_type": m.get("mime_type"),
-                     "size": m.get("file_size")}
-            kind, mtype = as_kind, field
-            break
-    if "text" in message:
-        mtype = "text"
+    # In a group, replies go to the group but limits and statistics follow the person.
+    person = str((message.get("from") or {}).get("id") or chat_id)
+    media, kind, mtype = _media_of(message)
+    quote = message.get("message_id")
+    text = message["text"].strip() if "text" in message else None
+    original = message.get("reply_to_message")
+    command = TRANSCRIBE.match(text) if text is not None else None
+    # "/transcribe@SomeOtherBot" is another bot's business.
+    if command and command.group(1) and _username and command.group(1)[1:].lower() != _username.lower():
+        command = None
+    if command and original:
+        # "/transcribe" in reply to audio: transcribe that audio, answering it.
+        media, kind, mtype = _media_of(original)
+        if media:
+            quote, text = original.get("message_id"), None
+    if media is None:
+        mtype = "text" if text is not None else "other"
     return {
         "sender": chat_id,
-        "user_key": f"tg:{chat_id}",
-        "message_id": message.get("message_id"),
+        "user_key": f"tg:{person}",
+        "message_id": quote,
         "type": mtype,
         "kind": kind,
-        "text": message.get("text", "").strip() if mtype == "text" else None,
+        "text": text if mtype == "text" else None,
         "media": media,
+        "group": message["chat"].get("type") in GROUP_TYPES,
     }
 
 
