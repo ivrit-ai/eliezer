@@ -28,6 +28,19 @@ https://status.eliezer.ivrit.ai
 
 צוות ivrit.ai"""
 
+# Sent once, and only once, to an unlinked WhatsApp number while WhatsApp replies are
+# off: the one billed message that tells it where its transcripts went.
+WA_DROPPED_NOTICE = """שלום,
+
+אליעזר כבר לא שולח תמלולים בוואטסאפ, כי וואטסאפ גובה מאתנו תשלום על כל הודעה.
+
+כדי להמשיך לקבל תמלולים, קשרו את הוואטסאפ שלכם ל-Communicator או לטלגרם. ההוראות:
+https://status.eliezer.ivrit.ai
+
+זו ההודעה היחידה שתקבלו מאתנו כאן.
+
+צוות ivrit.ai"""
+
 # --- linking (Telegram <-> WhatsApp)
 
 TG_WELCOME = (

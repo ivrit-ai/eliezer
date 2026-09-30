@@ -60,6 +60,16 @@ def init_identity_db(cur):
     cur.execute(
         "CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);"
     )
+    # WhatsApp numbers already told where transcripts went: each is told once, since
+    # every WhatsApp message is billed.
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS wa_told (
+          address  TEXT PRIMARY KEY,
+          told_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+        );
+        """
+    )
     # Until an admin says otherwise, WhatsApp works as it always has.
     cur.execute(
         "INSERT INTO settings (key, value) VALUES (%s, 'reply') ON CONFLICT DO NOTHING;",
@@ -206,6 +216,15 @@ def sweep_tokens(cur):
         "DELETE FROM link_tokens WHERE expires_at < now() - make_interval(secs => %s::double precision);",
         (TOKEN_GRACE_SECONDS,),
     )
+
+
+def mark_wa_told(cur, number):
+    """Record that number has been told where to get transcripts now. True only the
+    first time, so the caller tells it exactly once."""
+    cur.execute(
+        "INSERT INTO wa_told (address) VALUES (%s) ON CONFLICT DO NOTHING;", (str(number),)
+    )
+    return cur.rowcount == 1
 
 
 def mask(channel, address):

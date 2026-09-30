@@ -508,6 +508,10 @@ def _complete(handle, text, error, transcription_seconds, duration, edge):
                 source_handle=handle if i == 0 else f"{handle}#{i}", transcript=transcribed,
                 meta=meta,
             )
+            if notice:
+                # The notice points to the instructions, so the number counts as told:
+                # once replies are off, it is not billed for another.
+                identity.mark_wa_told(cur, target["address"])
         minutes = []
         if transcribed:
             admission = row["admission"] or {}

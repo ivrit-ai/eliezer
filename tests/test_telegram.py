@@ -140,6 +140,14 @@ def wa_texts(to, notices=False):
                 and m["text"]["body"].startswith(NOTICE) == notices]
 
 
+DROPPED = "שלום,\n\nאליעזר כבר לא שולח"
+
+
+def all_wa_texts(to):
+    with LOCK:
+        return [m for m in WA_SENT if m.get("type") == "text" and m.get("to") == to]
+
+
 def wa_receipts(mid):
     with LOCK:
         return [m for m in WA_SENT if m.get("status") == "read" and m.get("message_id") == mid]
@@ -407,11 +415,24 @@ def main():
         before = q("SELECT dropped_unlinked FROM totals")[0][0]
         mid = wa("972500000007")
         wa("919812345678")
+        wait_for(lambda: all_wa_texts("972500000007"), 10)
+        told = all_wa_texts("972500000007")
+        check("under drop, an unlinked number's first message gets one notice of where transcripts went",
+              len(told) == 1 and told[0]["text"]["body"].startswith(DROPPED)
+              and "status.eliezer.ivrit.ai" in told[0]["text"]["body"], told)
+        check("...no transcript, and no ticks", not wa_receipts(mid))
+        mid = wa("972500000007")
+        wa("972500000007", "text", text="hello?")
         time.sleep(3)
-        check("under drop, an unlinked WhatsApp voice note gets nothing - no reply, no ticks",
-              not wa_texts("972500000007") and not wa_receipts(mid))
-        check("...and counted as unlinked; the out-of-region number is ignored, but not as unlinked",
-              q("SELECT dropped_unlinked FROM totals")[0][0] == before + 1)
+        check("...and never another: later messages get nothing at all",
+              len(all_wa_texts("972500000007")) == 1 and not wa_receipts(mid), all_wa_texts("972500000007"))
+        check("...all counted as unlinked; the out-of-region number is ignored, but not as unlinked",
+              q("SELECT dropped_unlinked FROM totals")[0][0] == before + 3)
+        n = len(all_wa_texts("972500000001"))
+        wa("972500000001")
+        time.sleep(3)
+        check("a number already sent the pricing notice is not told again under drop",
+              len(all_wa_texts("972500000001")) == n, all_wa_texts("972500000001")[n:])
         tg(ADMIN, text="/wa_allow +972-50-000-0008 VIP")
         wait_for(lambda: len(tg_to(ADMIN)) >= 2)
         wa("972500000008")

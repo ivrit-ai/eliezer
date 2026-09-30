@@ -73,7 +73,7 @@ def split_text(channel, text, quote):
 
 
 def enqueue_text(cur, target, text, sent_at, extra=(), source_handle=None, buttons=None,
-                 transcript=False, meta=None):
+                 transcript=False, meta=None, billed_notice=False):
     """Queue a reply to target, in the caller's transaction. extra are further messages
     sent after it, unquoted (the nudge); buttons are links shown under the reply, where
     the channel supports them; meta describes it for channels that show more than text
@@ -81,8 +81,9 @@ def enqueue_text(cur, target, text, sent_at, extra=(), source_handle=None, butto
 
     WhatsApp bills every message, so it gets transcripts (transcript=True) and nothing
     else: notices, refusals and command answers are dropped there, and still go out on
-    every other channel."""
-    if target["channel"] == "whatsapp" and not transcript:
+    every other channel. The one exception is billed_notice, the once-per-number notice
+    of where transcripts went."""
+    if target["channel"] == "whatsapp" and not (transcript or billed_notice):
         return
     if target["channel"] == "notifier":
         if not notifier.enabled():
