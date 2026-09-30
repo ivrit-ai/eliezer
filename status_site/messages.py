@@ -88,6 +88,16 @@ TG_CHAT_UNLINKED = (
     "הם ממשיכים להגיע לאפליקציית Communicator; את הקישור אליה מבטלים מתוך האפליקציה."
 )
 
+# The one WhatsApp reply to a successful link: where the transcripts go from now on.
+WA_LINKED_TELEGRAM = (
+    "✅ הוואטסאפ שלכם מקושר לטלגרם.\n"
+    "אפשר להמשיך לשלוח לאליעזר הקלטות כאן בוואטסאפ, כרגיל. התמלולים יגיעו אליכם בטלגרם."
+)
+WA_LINKED_COMMUNICATOR = (
+    "✅ הוואטסאפ שלכם מקושר לאפליקציית Communicator.\n"
+    "אפשר להמשיך לשלוח לאליעזר הקלטות כאן בוואטסאפ, כרגיל. התמלולים יגיעו אליכם באפליקציה."
+)
+
 # --- linking the Notifier app
 
 def notifier_welcome(channel, masked):

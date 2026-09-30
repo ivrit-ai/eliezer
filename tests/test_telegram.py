@@ -299,7 +299,10 @@ def main():
         check("WhatsApp 'link <code>' links the number (Telegram told, masked)",
               "+972…001" in tg_to("111")[-1]["text"] and "מקושר" in tg_to("111")[-1]["text"], tg_to("111")[-1])
         time.sleep(1.5)
-        check("...and WhatsApp gets no confirmation message (it would cost)", not wa_texts("972500000001"))
+        wait_for(lambda: wa_texts("972500000001"), 10)
+        check("...and WhatsApp gets exactly one reply: keep sending here, transcripts go to Telegram",
+              len(wa_texts("972500000001")) == 1 and "מקושר לטלגרם" in wa_texts("972500000001")[0]["text"]["body"],
+              wa_texts("972500000001"))
         check("...and the link message was marked read", wa_receipts(mid))
 
         n_wa = len(wa_texts("972500000001"))
@@ -372,7 +375,8 @@ def main():
         wait_for(lambda: len(tg_to("444")) >= 2)
         time.sleep(1.5)
         check("the Telegram-first link works for this number", "+972…004" in tg_to("444")[-1]["text"])
-        check("...with no WhatsApp message back", len(wa_texts("972500000004")) == n)
+        check("...with its one WhatsApp reply", len(wa_texts("972500000004")) == n + 1
+              and "מקושר לטלגרם" in wa_texts("972500000004")[-1]["text"]["body"], wa_texts("972500000004")[n:])
 
         # ===== 11: re-linking to another chat tells the old one
         tg("555", text="/link")
@@ -452,7 +456,10 @@ def main():
         wa("972500000009", "text", text=f"link {t7}")
         wait_for(lambda: len(tg_to("777")) >= 2)
         check("linking still works under drop", "מקושר" in tg_to("777")[-1]["text"])
-        check("...without a WhatsApp confirmation", not wa_texts("972500000009"))
+        wait_for(lambda: wa_texts("972500000009"), 10)
+        check("...with one WhatsApp confirmation, even while WhatsApp replies are off",
+              len(wa_texts("972500000009")) == 1 and "מקושר לטלגרם" in wa_texts("972500000009")[0]["text"]["body"],
+              wa_texts("972500000009"))
         wa("972500000009")
         wait_for(lambda: any(m["text"] == "hello world" for m in tg_to("777")), 30)
         check("...and its voice notes reach Telegram", any(m["text"] == "hello world" for m in tg_to("777")))

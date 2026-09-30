@@ -284,7 +284,9 @@ def main():
         welcome = nt_to("sub-abcdefghjk", "welcome")[0]
         check("a welcome notification confirms it, in Hebrew", "אליעזר מקושר" in welcome["body"], welcome)
         time.sleep(1)
-        check("...WhatsApp gets no text at all (it would cost)", not wa_texts(num), wa_texts(num))
+        wait_for(lambda: wa_texts(num), 10)
+        check("...WhatsApp gets exactly one reply: keep sending here, transcripts go to the app",
+              len(wa_texts(num)) == 1 and "Communicator" in wa_texts(num)[0]["text"]["body"], wa_texts(num))
         check("...just the free read receipt", wa_receipts(mid))
 
         # ===== transcripts go to the Notifier, not WhatsApp
@@ -301,7 +303,7 @@ def main():
         check("...no nudge rides along as a separate notification (NUDGE_INTERVAL=1)",
               len(nt_to("sub-abcdefghjk", "transcript")) == 1 and len(nt_to("sub-abcdefghjk")) == 2,
               nt_to("sub-abcdefghjk"))
-        check("...and still nothing on WhatsApp", not wa_texts(num), wa_texts(num))
+        check("...and nothing more on WhatsApp", len(wa_texts(num)) == 1, wa_texts(num))
 
         # ===== a code that will never work
         num2 = "972500000002"

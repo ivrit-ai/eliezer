@@ -8,8 +8,9 @@ single-use and expire after 15 minutes.
 
 The Notifier app links the other way round: it shows the code, and the user sends
 "link <code>" from WhatsApp (or Telegram). Its codes are ten characters to Telegram's
-eight, which is how the two are told apart. The outcome shows in the app; WhatsApp only
-ever gets the free read receipt.
+eight, which is how the two are told apart. The outcome shows in the app. Either way, a
+successful link from WhatsApp earns exactly one WhatsApp reply saying where transcripts
+go now; a failed one gets only the free read receipt.
 """
 
 import os
@@ -61,10 +62,10 @@ def _link_whatsapp(cur, user_id, number, sent_at):
     masked = identity.mask("whatsapp", number)
     for chat in previous_chats:
         outbox.enqueue_text(cur, _tg(chat), messages.tg_moved_away(masked), sent_at)
-    # Confirmed on Telegram only: a WhatsApp message would cost, and the user is looking
-    # at Telegram anyway.
     for chat in _chats(cur, user_id):
         outbox.enqueue_text(cur, _tg(chat), messages.tg_linked(masked), sent_at)
+    # One billed WhatsApp reply, so the user knows to keep sending recordings there.
+    _tell_whatsapp(cur, number, messages.WA_LINKED_TELEGRAM, sent_at)
 
 
 # --- Notifier
@@ -113,6 +114,14 @@ def notifier_redeemed(cur, owner, status, subscription_id, sent_at):
                         messages.notifier_welcome(channel, masked), sent_at, meta={"kind": "welcome"})
     for chat in _chats(cur, user_id):
         outbox.enqueue_text(cur, _tg(chat), messages.TG_NOTIFIER_LINKED, sent_at)
+    if channel == "whatsapp":
+        _tell_whatsapp(cur, address, messages.WA_LINKED_COMMUNICATOR, sent_at)
+
+
+def _tell_whatsapp(cur, number, text, sent_at):
+    """The single WhatsApp message a successful link earns: billed, so exactly one."""
+    outbox.enqueue_text(cur, {"channel": "whatsapp", "address": str(number), "quote": None}, text,
+                        sent_at, billed_notice=True)
 
 
 def _outputs(cur, user_id, channel):
@@ -127,7 +136,8 @@ def is_whatsapp_link(text):
 
 def handle_whatsapp_link(cur, parsed, sent_at):
     """"link <code>" from WhatsApp. Outcomes are reported in Telegram, where the code
-    came from; a wrong code gets no answer, since any WhatsApp reply is billed."""
+    came from; a success also gets one WhatsApp reply, and a wrong code none, since any
+    WhatsApp reply is billed."""
     number = parsed["sender"]
     status, user_id = identity.consume_token(cur, LINK_WITH_CODE.match(parsed["text"]).group(1))
     if status == "ok" and limits.is_allowed_region(number):
