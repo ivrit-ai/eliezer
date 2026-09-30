@@ -1,6 +1,8 @@
 """What every channel adapter shares.
 
-An adapter module (whatsapp.py, telegram.py) provides:
+An adapter module (whatsapp.py, telegram.py) provides the following; notifier.py is
+output-only, and provides just the replies part (its send_text also takes meta and
+dedupe_key):
   webhooks: verify_registration(args), verify_payload(raw, headers), split(payload), parse(body)
   replies:  target(parsed), MAX_TEXT_LENGTH, send_text(address, text, quote, buttons),
             send_receipt(address, message_id, typing)

@@ -14,6 +14,8 @@ from datetime import datetime, timezone
 import psycopg
 from psycopg.rows import dict_row
 
+import notifier
+
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
 STALE_SECONDS = int(os.environ.get("STALE_SECONDS", "90"))
 
@@ -92,6 +94,9 @@ def init_db():
         )
         cur.execute(
             "ALTER TABLE totals ADD COLUMN IF NOT EXISTS tg_sent BIGINT NOT NULL DEFAULT 0;"
+        )
+        cur.execute(
+            "ALTER TABLE totals ADD COLUMN IF NOT EXISTS nt_sent BIGINT NOT NULL DEFAULT 0;"
         )
         # Telegram groups the bot is in. Chat ids only; active turns off when it leaves.
         cur.execute(
@@ -299,17 +304,23 @@ def compute_stats(queue_depth=None):
     """Everything /api/stats serves. queue_depth is the hub's live depth."""
     with connect() as conn, conn.cursor() as cur:
         cur.execute(
-            "SELECT messages, transcriptions, duration_seconds, dropped, wa_sent, tg_sent, dropped_unlinked "
+            "SELECT messages, transcriptions, duration_seconds, dropped, wa_sent, tg_sent, nt_sent, dropped_unlinked "
             "FROM totals WHERE id = 1;"
         )
         totals = cur.fetchone() or {
             "messages": 0, "transcriptions": 0, "duration_seconds": 0, "dropped": 0,
-            "wa_sent": 0, "tg_sent": 0, "dropped_unlinked": 0,
+            "wa_sent": 0, "tg_sent": 0, "nt_sent": 0, "dropped_unlinked": 0,
         }
         cur.execute(
-            "SELECT count(DISTINCT user_id) AS n FROM identities WHERE channel <> 'whatsapp';"
+            """
+            SELECT count(DISTINCT user_id) AS n,
+                   count(DISTINCT user_id) FILTER (WHERE channel = 'telegram') AS telegram,
+                   count(DISTINCT user_id) FILTER (WHERE channel = 'notifier') AS notifier
+              FROM identities WHERE channel <> 'whatsapp';
+            """
         )
-        linked_users = int(cur.fetchone()["n"])
+        linked = cur.fetchone()
+        linked_users = int(linked["n"])
         cur.execute("SELECT count(*) AS n FROM telegram_groups WHERE active;")
         telegram_groups = int(cur.fetchone()["n"])
 
@@ -418,6 +429,7 @@ def compute_stats(queue_depth=None):
                 "dropped": totals["dropped"],
                 "wa_sent": totals["wa_sent"],
                 "tg_sent": totals["tg_sent"],
+                "nt_sent": totals["nt_sent"],
                 "dropped_unlinked": totals["dropped_unlinked"],
             },
             "messages": {
@@ -435,6 +447,10 @@ def compute_stats(queue_depth=None):
             },
             "unique_users_24h": unique_users_24h,
             "linked_users": linked_users,
+            "linked_telegram": int(linked["telegram"]),
+            "linked_notifier": int(linked["notifier"]),
+            # Where the status page sends people to install the app; absent when it is off.
+            "notifier_url": notifier.PUBLIC_URL if notifier.enabled() else None,
             "telegram_groups": telegram_groups,
             "queue_depth": queue_depth,
             "instances": [

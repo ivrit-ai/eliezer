@@ -107,6 +107,21 @@
     <a class="button" href="https://t.me/BenYehudaBot">פתיחת <bdi>@BenYehudaBot</bdi> בטלגרם</a>
   </section>
 
+  <!-- Shown once the hub reports where the Notifier app lives. -->
+  <section class="notice" id="notifier-notice" dir="rtl" lang="he" hidden>
+    <h2>או: מקבלים את התמלולים כהתראות, בלי טלגרם</h2>
+    <p>אפליקציית Notifier מציגה את התמלולים כהתראות בטלפון או במחשב, ושומרת אותם במכשיר. לא צריך טלגרם, ואפשר גם בלי חשבון.</p>
+
+    <h3>איך מתחברים:</h3>
+    <ol>
+      <li>פתחו את <a class="notifier-link" href="#"><bdi>Notifier</bdi></a>. באייפון, הוסיפו אותו קודם למסך הבית ופתחו משם.</li>
+      <li>בחרו <strong>מקורות</strong>, לחצו <strong>קישור</strong> ליד אליעזר, ואשרו התראות.</li>
+      <li>לחצו <strong>פתיחת וואטסאפ</strong> ושלחו לאליעזר את ההודעה שנפתחה כמו שהיא. האפליקציה תראה מיד שהקישור הצליח.</li>
+    </ol>
+
+    <a class="button notifier-link" href="#">פתיחת <bdi>Notifier</bdi></a>
+  </section>
+
   <div class="grid" id="cards"></div>
 
   <div class="chart-card">
@@ -315,6 +330,10 @@
       try {
         const r = await fetch("/api/stats", { cache: "no-store" });
         const d = await r.json();
+        if (d.notifier_url) {
+          document.querySelectorAll(".notifier-link").forEach(a => (a.href = d.notifier_url));
+          document.getElementById("notifier-notice").hidden = false;
+        }
         const t = d.totals, m = d.messages, tr = d.transcriptions_1h;
 
         document.getElementById("cards").innerHTML = [
@@ -331,8 +350,11 @@
           card("Dropped",                  fmtNum(t.dropped)),
           card("WhatsApp sent",            fmtNum(t.wa_sent)),
           card("Telegram sent",            fmtNum(t.tg_sent)),
+          card("Notifier sent",            fmtNum(t.nt_sent)),
           card("Telegram groups",          fmtNum(d.telegram_groups)),
           card("Linked users",             fmtNum(d.linked_users)),
+          card("Linked · Telegram",        fmtNum(d.linked_telegram)),
+          card("Linked · Notifier",        fmtNum(d.linked_notifier)),
           card("Unlinked, ignored",        fmtNum(t.dropped_unlinked)),
           card("Live instances",           fmtNum(d.live_instances)),
         ].join("");

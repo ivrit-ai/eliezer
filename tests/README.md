@@ -10,6 +10,7 @@ using real audio generated with ffmpeg.
 | `test_queue.py` | Queue mechanics: signed webhooks, dedup, batch splitting, expiry and the sweeper, poison messages, the overflow threshold, edge auth, long-polls, prompt SIGTERM. |
 | `test_whatsapp.py` | The WhatsApp path end to end: media through the hub, admission (10-minute cap, fleet-wide rate limits), transcripts-only WhatsApp replies, the pricing notice, long replies, send retries and resumption, safe completion retries, statistics. |
 | `test_telegram.py` | Telegram, linking and admin: link flow, delivery to Telegram, the reply policy and allowlist, unlink and blocked bots, groups and `/transcribe`, group and sent-message counters, recovery from media failures. |
+| `test_notifier.py` | The Notifier app as an output: linking by code from WhatsApp and from a Telegram deep link, transcripts to the app instead of WhatsApp, a number moving to Telegram keeping its app, `/unlink` with an app linked, retries on 429, unbinding on 410, dashboard counters. |
 
 ## Running
 

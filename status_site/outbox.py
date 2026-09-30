@@ -15,6 +15,7 @@ import time
 
 import db
 import identity
+import notifier
 import telegram
 import whatsapp
 from channel import SendError
@@ -22,9 +23,9 @@ from channel import SendError
 log = logging.getLogger(__name__)
 
 # Channel adapters (see channel.py for what each provides).
-CHANNELS = {"whatsapp": whatsapp, "telegram": telegram}
+CHANNELS = {"whatsapp": whatsapp, "telegram": telegram, "notifier": notifier}
 # Messages delivered per channel, for the dashboard. WhatsApp's is the one it bills.
-SENT_COUNTERS = {"whatsapp": "wa_sent", "telegram": "tg_sent"}
+SENT_COUNTERS = {"whatsapp": "wa_sent", "telegram": "tg_sent", "notifier": "nt_sent"}
 
 SENDER_THREADS = int(os.environ.get("OUTBOX_SENDERS", "4"))
 # A claimed row is invisible to other senders for this long; a sender that dies mid-send
@@ -72,19 +73,28 @@ def split_text(channel, text, quote):
 
 
 def enqueue_text(cur, target, text, sent_at, extra=(), source_handle=None, buttons=None,
-                 transcript=False):
+                 transcript=False, meta=None):
     """Queue a reply to target, in the caller's transaction. extra are further messages
     sent after it, unquoted (the nudge); buttons are links shown under the reply, where
-    the channel supports them. sent_at is when the user sent what this answers.
+    the channel supports them; meta describes it for channels that show more than text
+    (the Notifier: kind, subtitle). sent_at is when the user sent what this answers.
 
     WhatsApp bills every message, so it gets transcripts (transcript=True) and nothing
     else: notices, refusals and command answers are dropped there, and still go out on
     every other channel."""
     if target["channel"] == "whatsapp" and not transcript:
         return
+    if target["channel"] == "notifier":
+        if not notifier.enabled():
+            return
+        # Each extra would be a notification of its own.
+        extra = ()
     parts = split_text(target["channel"], text, target.get("quote"))
     if buttons:
         parts[-1]["buttons"] = buttons
+    if meta:
+        for part in parts:
+            part["meta"] = meta
     parts += [{"text": e, "quote": None} for e in extra if e]
     cur.execute(
         """
@@ -92,6 +102,20 @@ def enqueue_text(cur, target, text, sent_at, extra=(), source_handle=None, butto
         VALUES (%s, %s, 'text', %s, to_timestamp(%s), %s);
         """,
         (target["channel"], target["address"], json.dumps({"parts": parts}), sent_at, source_handle),
+    )
+    _wakeup.set()
+
+
+def enqueue_link(cur, code, owner, sent_at):
+    """Queue redeeming a Notifier link code that owner (a WhatsApp number or Telegram
+    chat) sent us. A network call, so it goes through the senders and their retries
+    rather than holding up the webhook."""
+    cur.execute(
+        """
+        INSERT INTO outbox (channel, address, action, payload, sent_at)
+        VALUES ('notifier', %s, 'link', %s, to_timestamp(%s));
+        """,
+        (f"{owner['channel']}:{owner['address']}", json.dumps({"code": code, "owner": owner}), sent_at),
     )
     _wakeup.set()
 
@@ -158,6 +182,9 @@ def _execute(sql, params):
 
 def _deliver(row):
     adapter = CHANNELS[row["channel"]]
+    if row["action"] == "link":
+        _redeem(row)
+        return
     if row["action"] != "text":
         adapter.send_receipt(row["address"], row["payload"]["message_id"], row["action"] == "typing")
         return
@@ -165,12 +192,32 @@ def _deliver(row):
     for i in range(row["parts_sent"], len(parts)):
         if i > row["parts_sent"]:
             time.sleep(PART_INTERVAL_SECONDS)
-        adapter.send_text(row["address"], parts[i]["text"], parts[i].get("quote"), parts[i].get("buttons"))
+        part = parts[i]
+        if row["channel"] == "notifier":
+            # The row id and part number make a retry of this very part land once.
+            adapter.send_text(row["address"], part["text"], part.get("quote"), part.get("buttons"),
+                              meta=part.get("meta"), dedupe_key=f"outbox:{row['id']}:{i}")
+        else:
+            adapter.send_text(row["address"], part["text"], part.get("quote"), part.get("buttons"))
         # Record each part as it goes, so a retry after a failure resumes here.
         _execute("UPDATE outbox SET parts_sent = %s WHERE id = %s;", (i + 1, row["id"]))
         counter = SENT_COUNTERS.get(row["channel"])
         if counter:
             _execute(f"UPDATE totals SET {counter} = {counter} + 1 WHERE id = 1;", ())
+
+
+def _redeem(row):
+    """Trade a link code for a subscription, then bind it. Transient failures raise and
+    are retried like any send; a code that will never work ends here."""
+    import control  # control enqueues into the outbox, so it cannot be imported at the top
+
+    owner = row["payload"]["owner"]
+    label = control.notifier_label(owner)
+    status, subscription_id = notifier.redeem(
+        row["payload"]["code"], notifier.subject(owner["channel"], owner["address"]), label)
+    with db.pool().connection() as conn, conn.cursor() as cur:
+        control.notifier_redeemed(cur, owner, status, subscription_id, time.time())
+        conn.commit()
 
 
 def _unbind(channel, address):
@@ -192,7 +239,7 @@ def _send_one(row):
             _execute("DELETE FROM outbox WHERE channel = %s AND address = %s;",
                      (row["channel"], row["address"]))
             return
-        if row["action"] == "text" and e.retryable:
+        if row["action"] in ("text", "link") and e.retryable:
             delay = e.retry_after or min(5 * 2 ** (row["attempts"] - 1), MAX_BACKOFF_SECONDS)
             log.debug("outbox %s to %s:%s failed (%s); retry in %ss",
                       row["id"], row["channel"], row["address"], e, delay)

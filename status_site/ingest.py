@@ -119,6 +119,13 @@ def _route(source, items):
                     continue
 
             text = parsed["text"]
+            if source == "whatsapp" and control.is_notifier_link(text):
+                # Like the Telegram link below: the outcome shows in the Notifier app,
+                # and WhatsApp gets nothing but the (free) read receipt.
+                outbox.enqueue_receipt(cur, default, typing=False, sent_at=sent_at)
+                control.handle_notifier_link(cur, "whatsapp", parsed["sender"], control.notifier_code(text), sent_at)
+                counts["answered"] += 1
+                continue
             if source == "whatsapp" and control.is_whatsapp_link(text):
                 # Linking must work for exactly the people WhatsApp is being turned off
                 # for, so it comes before any decision about where replies go.

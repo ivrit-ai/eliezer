@@ -71,6 +71,32 @@ def tg_unlinked(masked_numbers):
 
 
 TG_NOTHING_TO_UNLINK = "הצ'אט הזה לא מקושר לאף מספר וואטסאפ."
+TG_CHAT_UNLINKED = (
+    "הצ'אט הזה נותק, והתמלולים לא יגיעו אליו יותר. "
+    "הם ממשיכים להגיע לאפליקציית Notifier; את הקישור אליה מבטלים מתוך האפליקציה."
+)
+
+# --- linking the Notifier app
+
+def notifier_welcome(channel, masked):
+    where = "בוואטסאפ" if channel == "whatsapp" else "בטלגרם"
+    return (
+        f"✅ אליעזר מקושר ({masked}). "
+        f"מעכשיו התמלולים של ההקלטות שתשלחו לאליעזר {where} יגיעו לכאן, כהתראות."
+    )
+
+
+TG_NOTIFIER_LINKED = "✅ אפליקציית Notifier מקושרת. התמלולים יגיעו גם אליה."
+TG_NOTIFIER_CODE_FAILED = "הקוד לא תקין או שתוקפו פג. צרו קוד חדש באפליקציית Notifier ונסו שוב."
+
+
+def transcript_subtitle(seconds):
+    """What a transcript notification says under the name: that it is one, and how long
+    the recording was."""
+    if not seconds:
+        return "תמלול הקלטה"
+    seconds = int(round(seconds))
+    return f"תמלול הקלטה · {seconds // 60}:{seconds % 60:02d}"
 TG_HELP = (
     "שלחו לי הקלטה ואתמלל אותה.\n\n"
     "/link – קישור לוואטסאפ: התמלולים של הקלטות מוואטסאפ יגיעו לכאן\n"

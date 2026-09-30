@@ -1,6 +1,6 @@
 """Who is who across channels, and where their replies go.
 
-A user is a set of identities - a WhatsApp number, a Telegram chat, later a PWA - joined
+A user is a set of identities - a WhatsApp number, a Telegram chat, a Notifier app - joined
 by linking. Only people who link or are allowlisted get a user; everyone else stays an
 anonymous sender. Each identity has a deliver flag: replies go to every identity with it
 set, and WhatsApp additionally needs permission (the global policy, or the allowlist),
@@ -21,7 +21,7 @@ POLICIES = ("reply", "drop")
 
 # Channels whose identity is a real user-facing output (as opposed to WhatsApp, the input
 # channel users are being moved off).
-OUTPUT_CHANNELS = ("telegram",)
+OUTPUT_CHANNELS = ("telegram", "notifier")
 
 
 def init_identity_db(cur):

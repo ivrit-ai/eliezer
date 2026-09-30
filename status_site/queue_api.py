@@ -496,6 +496,9 @@ def _complete(handle, text, error, transcription_seconds, duration, edge):
         transcribed = error is None
         reply = text if transcribed else messages.ONLY_RECORDINGS
         nudge = messages.maybe_nudge() if transcribed else None
+        seconds = (row["admission"] or {}).get("duration") or duration
+        meta = ({"kind": "transcript", "subtitle": messages.transcript_subtitle(seconds)}
+                if transcribed else {"kind": "notice"})
         for i, target in enumerate(targets):
             # Users still getting transcripts on WhatsApp are told WhatsApp now charges
             # for these messages, after each one.
@@ -503,6 +506,7 @@ def _complete(handle, text, error, transcription_seconds, duration, edge):
             outbox.enqueue_text(
                 cur, target, reply, row["sent_at"], extra=[notice, nudge],
                 source_handle=handle if i == 0 else f"{handle}#{i}", transcript=transcribed,
+                meta=meta,
             )
         minutes = []
         if transcribed:
