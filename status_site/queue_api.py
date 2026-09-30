@@ -501,8 +501,13 @@ def _complete(handle, text, error, transcription_seconds, duration, edge):
                 if transcribed else {"kind": "notice"})
         for i, target in enumerate(targets):
             # Users still getting transcripts on WhatsApp are told WhatsApp now charges
-            # for these messages, after each one.
-            notice = messages.WA_PRICING_NOTICE if transcribed and target["channel"] == "whatsapp" else None
+            # for these messages, after each one - except allowlisted numbers, which
+            # keep WhatsApp on purpose and have nothing to act on.
+            notice = None
+            if transcribed and target["channel"] == "whatsapp":
+                owner = identity.user_of(cur, "whatsapp", target["address"])
+                if not (owner and owner["wa_replies_allowed"]):
+                    notice = messages.WA_PRICING_NOTICE
             outbox.enqueue_text(
                 cur, target, reply, row["sent_at"], extra=[notice, nudge],
                 source_handle=handle if i == 0 else f"{handle}#{i}", transcript=transcribed,

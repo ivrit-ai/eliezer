@@ -443,8 +443,9 @@ def main():
         wait_for(lambda: wa_texts("972500000008"), 30)
         check("an allowlisted number keeps WhatsApp replies under drop",
               wa_texts("972500000008") and wa_texts("972500000008")[-1]["text"]["body"] == "hello world")
-        check("an allowlisted WhatsApp number gets the pricing notice too",
-              wait_for(lambda: wa_texts("972500000008", notices=True), 10))
+        time.sleep(2)
+        check("an allowlisted WhatsApp number does not get the pricing notice",
+              not wa_texts("972500000008", notices=True), wa_texts("972500000008", notices=True))
         tg("777", text="/link")
         wait_for(lambda: tg_to("777"))
         t7 = token_from(tg_to("777"))
