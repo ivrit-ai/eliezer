@@ -368,6 +368,7 @@
           card("Linked · Telegram",        fmtNum(d.linked_telegram)),
           card("Linked · Communicator",    fmtNum(d.linked_notifier)),
           card("Unlinked, ignored",        fmtNum(t.dropped_unlinked)),
+          card("Notified once, now silent", fmtNum(t.wa_told)),
           card("Live instances",           fmtNum(d.live_instances)),
         ].join("");
 

@@ -70,6 +70,8 @@ def init_identity_db(cur):
         );
         """
     )
+    # The dashboard's running count starts from whatever is already recorded.
+    cur.execute("UPDATE totals SET wa_told = (SELECT count(*) FROM wa_told) WHERE id = 1;")
     # Until an admin says otherwise, WhatsApp works as it always has.
     cur.execute(
         "INSERT INTO settings (key, value) VALUES (%s, 'reply') ON CONFLICT DO NOTHING;",
@@ -224,7 +226,10 @@ def mark_wa_told(cur, number):
     cur.execute(
         "INSERT INTO wa_told (address) VALUES (%s) ON CONFLICT DO NOTHING;", (str(number),)
     )
-    return cur.rowcount == 1
+    if cur.rowcount != 1:
+        return False
+    cur.execute("UPDATE totals SET wa_told = wa_told + 1 WHERE id = 1;")
+    return True
 
 
 def mask(channel, address):

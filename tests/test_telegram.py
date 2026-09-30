@@ -433,6 +433,10 @@ def main():
         time.sleep(3)
         check("a number already sent the pricing notice is not told again under drop",
               len(all_wa_texts("972500000001")) == n, all_wa_texts("972500000001")[n:])
+        told = q("SELECT count(*) FROM wa_told")[0][0]
+        st, body = http("GET", "/api/stats")
+        check("the dashboard counts the numbers told once", json.loads(body)["totals"]["wa_told"] == told and told >= 2,
+              (json.loads(body)["totals"].get("wa_told"), told))
         tg(ADMIN, text="/wa_allow +972-50-000-0008 VIP")
         wait_for(lambda: len(tg_to(ADMIN)) >= 2)
         wa("972500000008")
