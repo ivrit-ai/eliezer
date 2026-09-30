@@ -21,15 +21,15 @@ python whatsapp_bot.py            # or transcribe on RunPod (needs RUNPOD_* in .
 `--num-workers N` sets concurrent transcriptions (default 1 with `--local`, else 10).
 `--overflow-handler N` makes the edge take work only while more than N jobs are waiting.
 
-## The Notifier app
+## The Communicator app
 
-Besides Telegram, the hub can deliver transcripts as push notifications through a
-[Notifier](https://notifier-bender.xhostd.app) instance, where Eliezer is registered as a
-source. A user links it from the app, which shows a code: sending `link <code>` to Eliezer
+Besides Telegram, the hub can deliver transcripts as push notifications through
+[Communicator](https://communicator.ivrit.ai) (a Notifier instance), where Eliezer is
+registered as a source. A user links it from the app, which shows a code: sending `link <code>` to Eliezer
 on WhatsApp (or tapping the app's Telegram button) links it, and from then on their
 transcripts go to the app instead of WhatsApp. The hub needs:
 
-- `NOTIFIER_URL`: the Notifier instance.
+- `NOTIFIER_URL`: the instance, e.g. `https://communicator.ivrit.ai`.
 - `NOTIFIER_SOURCE_KEY`: Eliezer's source key, from the instance's admin page.
 - `NOTIFIER_PUBLIC_URL` (optional): where the status page sends people to open the app,
   if not `NOTIFIER_URL`.

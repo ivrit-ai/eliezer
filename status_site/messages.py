@@ -73,7 +73,7 @@ def tg_unlinked(masked_numbers):
 TG_NOTHING_TO_UNLINK = "הצ'אט הזה לא מקושר לאף מספר וואטסאפ."
 TG_CHAT_UNLINKED = (
     "הצ'אט הזה נותק, והתמלולים לא יגיעו אליו יותר. "
-    "הם ממשיכים להגיע לאפליקציית Notifier; את הקישור אליה מבטלים מתוך האפליקציה."
+    "הם ממשיכים להגיע לאפליקציית Communicator; את הקישור אליה מבטלים מתוך האפליקציה."
 )
 
 # --- linking the Notifier app
@@ -86,8 +86,8 @@ def notifier_welcome(channel, masked):
     )
 
 
-TG_NOTIFIER_LINKED = "✅ אפליקציית Notifier מקושרת. התמלולים יגיעו גם אליה."
-TG_NOTIFIER_CODE_FAILED = "הקוד לא תקין או שתוקפו פג. צרו קוד חדש באפליקציית Notifier ונסו שוב."
+TG_NOTIFIER_LINKED = "✅ אפליקציית Communicator מקושרת. התמלולים יגיעו גם אליה."
+TG_NOTIFIER_CODE_FAILED = "הקוד לא תקין או שתוקפו פג. צרו קוד חדש באפליקציית Communicator ונסו שוב."
 
 
 def transcript_subtitle(seconds):

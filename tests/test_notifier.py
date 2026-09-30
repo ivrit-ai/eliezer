@@ -317,7 +317,7 @@ def main():
         tg("222", text="/start link-TELEGRAM01")
         wait_for(lambda: tg_to("222"))
         check("a t.me deep link links the Notifier to the chat, confirmed there",
-              tg_to("222") and "Notifier" in tg_to("222")[-1]["text"], tg_to("222"))
+              tg_to("222") and "Communicator" in tg_to("222")[-1]["text"], tg_to("222"))
         check("...labelled as Telegram", REDEEMS[-1]["label"].startswith("Telegram"), REDEEMS[-1])
         n_tg = len(tg_to("222"))
         tg("222", voice="f-short")
