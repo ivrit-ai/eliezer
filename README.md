@@ -25,9 +25,9 @@ python whatsapp_bot.py            # or transcribe on RunPod (needs RUNPOD_* in .
 
 Besides Telegram, the hub can deliver transcripts as push notifications through
 [Communicator](https://communicator.ivrit.ai) (a Notifier instance), where Eliezer is
-registered as a source. A user links it from the app, which shows a code: sending `link <code>` to Eliezer
-on WhatsApp (or tapping the app's Telegram button) links it, and from then on their
-transcripts go to the app instead of WhatsApp. The hub needs:
+registered as a source. A user links it from the app, which shows a code: sending
+`link <code>` to Eliezer on WhatsApp links it, and from then on their transcripts go to
+the app instead of WhatsApp. The hub needs:
 
 - `NOTIFIER_URL`: the instance, e.g. `https://communicator.ivrit.ai`.
 - `NOTIFIER_SOURCE_KEY`: Eliezer's source key, from the instance's admin page.
