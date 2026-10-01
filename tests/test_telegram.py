@@ -341,14 +341,21 @@ def main():
         wait_for(lambda: wa_receipts(mid))
         time.sleep(1)
         check("an unknown link code gets no WhatsApp reply (it would be billed)", not wa_texts("972500000002"))
+        wait_for(lambda: wa_reactions(mid), 10)
+        check("...but a (free) thumbs down on the link message",
+              wa_reactions(mid) and wa_reactions(mid)[0].get("reaction", {}).get("emoji") == "👎", wa_reactions(mid))
         tg("333", text="/link")
         wait_for(lambda: tg_to("333"))
         t3 = token_from(tg_to("333"))
         q("UPDATE link_tokens SET expires_at = now() - interval '1 minute' WHERE token = %s RETURNING token", t3)
-        wa("972500000003", "text", text=f"link {t3}")
+        check("the code offer says it lasts 15 minutes", "15 דקות" in tg_to("333")[-1]["text"], tg_to("333")[-1]["text"])
+        mid3 = wa("972500000003", "text", text=f"link {t3}")
         wait_for(lambda: len(tg_to("333")) >= 2)
         check("an expired code is reported in the Telegram chat that asked for it",
               "פג" in tg_to("333")[-1]["text"] and not q("SELECT 1 FROM identities WHERE address = '972500000003'"))
+        wait_for(lambda: wa_reactions(mid3), 10)
+        check("...and gets a thumbs down on WhatsApp",
+              wa_reactions(mid3) and wa_reactions(mid3)[0].get("reaction", {}).get("emoji") == "👎", wa_reactions(mid3))
 
         # ===== 9: /unlink returns the number to WhatsApp
         tg("111", text="/unlink")

@@ -9,8 +9,8 @@ single-use and expire after 15 minutes.
 The Notifier app links the other way round: it shows the code, and the user sends
 "link <code>" from WhatsApp (or Telegram). Its codes are ten characters to Telegram's
 eight, which is how the two are told apart. The outcome shows in the app. Either way, a
-successful link from WhatsApp earns an emoji reaction (and read receipt)
-on the link message; a failed one gets only the free read receipt.
+link message from WhatsApp gets an emoji reaction (free): 👍 when it linked, 👎 when it
+did not (unknown, expired or used code), so the sender is never left guessing.
 """
 
 import os
@@ -66,7 +66,7 @@ def _link_whatsapp_to_telegram(cur, user_id, number, sent_at, message_id=None):
     for chat in _chats(cur, user_id):
         outbox.enqueue_text(cur, _tg(chat), messages.tg_linked(masked), sent_at)
     if message_id:
-        _tell_whatsapp(cur, number, message_id, sent_at)
+        _react_whatsapp(cur, number, message_id, True, sent_at)
 
 
 _link_whatsapp = _link_whatsapp_to_telegram  # backwards-compatibility alias
@@ -104,10 +104,12 @@ def notifier_redeemed(cur, owner, status, subscription_id, sent_at):
     replies there, which is the point."""
     channel, address = owner["channel"], owner["address"]
     if status != "ok":
-        # The app already says what went wrong. Telegram costs nothing, so it hears too;
-        # WhatsApp would cost, so it does not.
+        # The app already says what went wrong. Telegram costs nothing, so it hears in
+        # words; WhatsApp gets a (free) thumbs down on the link message.
         if channel == "telegram":
             outbox.enqueue_text(cur, _tg(address), messages.TG_NOTIFIER_CODE_FAILED, sent_at)
+        elif owner.get("message_id"):
+            _react_whatsapp(cur, address, owner["message_id"], False, sent_at)
         return
     user_id = identity.ensure_user(cur, channel, address, deliver=channel == "telegram")
     if channel == "whatsapp":
@@ -119,15 +121,16 @@ def notifier_redeemed(cur, owner, status, subscription_id, sent_at):
     for chat in _chats(cur, user_id):
         outbox.enqueue_text(cur, _tg(chat), messages.TG_NOTIFIER_LINKED, sent_at)
     if channel == "whatsapp" and owner.get("message_id"):
-        _tell_whatsapp(cur, address, owner["message_id"], sent_at)
+        _react_whatsapp(cur, address, owner["message_id"], True, sent_at)
 
 
-def _tell_whatsapp(cur, number, message_id, sent_at, emoji="👍"):
-    """React to the link message with an emoji thumbs up (free of charge on WhatsApp)."""
+def _react_whatsapp(cur, number, message_id, linked, sent_at):
+    """Answer a link message on WhatsApp with 👍 (linked) or 👎 (not): reactions are free,
+    where any text reply would be billed."""
     if not message_id:
         return
     outbox.enqueue_reaction(cur, {"channel": "whatsapp", "address": str(number), "quote": message_id},
-                            emoji, sent_at)
+                            "👍" if linked else "👎", sent_at)
 
 
 def _outputs(cur, user_id, channel):
@@ -150,16 +153,18 @@ def is_telegram_link(text):
 
 def handle_telegram_link(cur, parsed, sent_at):
     """"link <code>" from WhatsApp to link with a Telegram chat. Outcomes are reported
-    in Telegram, where the code came from; a success gets a thumbs up reaction on WhatsApp,
-    and a wrong code none."""
+    in Telegram, where the code came from (when it is known), and on WhatsApp as a
+    reaction on the link message: 👍 linked, 👎 not."""
     number = parsed["sender"]
     code = telegram_code(parsed["text"])
     status, user_id = identity.consume_token(cur, code)
     if status == "ok" and limits.is_allowed_region(number):
         _link_whatsapp_to_telegram(cur, user_id, number, sent_at, message_id=parsed.get("message_id"))
-    elif status == "expired":
+        return
+    if status == "expired":
         for chat in _chats(cur, user_id):
             outbox.enqueue_text(cur, _tg(chat), messages.TG_LINK_EXPIRED, sent_at)
+    _react_whatsapp(cur, number, parsed.get("message_id"), False, sent_at)
 
 
 # Backwards-compatibility aliases

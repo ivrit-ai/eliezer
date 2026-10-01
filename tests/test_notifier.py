@@ -319,7 +319,9 @@ def main():
         wait_for(lambda: any(r["code"] == "ZZZZZZZZZZ" for r in REDEEMS))
         time.sleep(1.5)
         check("an expired code from WhatsApp gets no WhatsApp answer", not wa_texts(num2), wa_texts(num2))
-        check("...and no reaction on WhatsApp", not wa_reactions(mid2))
+        wait_for(lambda: wa_reactions(mid2), 10)
+        check("...but a (free) thumbs down on the link message",
+              wa_reactions(mid2) and wa_reactions(mid2)[0].get("reaction", {}).get("emoji") == "👎", wa_reactions(mid2))
         check("...and links nothing", not q("SELECT 1 FROM identities WHERE channel = 'notifier' AND address LIKE 'sub-zz%%'"))
 
         # ===== from Telegram, by deep link

@@ -57,7 +57,10 @@ LINK_BUTTON = "קישור לוואטסאפ"
 
 
 def tg_link_code_hint(token):
-    return f"\n\nאם הכפתור לא עובד, שלחו לאליעזר בוואטסאפ את ההודעה: link {token}"
+    return (
+        f"\n\nאם הכפתור לא עובד, שלחו לאליעזר בוואטסאפ את ההודעה: link {token}"
+        f"\n\n⏱ הכפתור והקוד בתוקף ל-15 דקות בלבד. אחרי זה שלחו כאן /link לקבלת קוד חדש."
+    )
 
 
 def tg_linked(masked):
