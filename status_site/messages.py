@@ -58,7 +58,7 @@ LINK_BUTTON = "קישור לוואטסאפ"
 
 # What an offer message says once its code can no longer be used (see offers.py).
 OFFER_USED = "✅ הקוד נוצל והקישור הושלם."
-OFFER_REPLACED = "↩️ הקוד הזה הוחלף בקוד חדש, בהודעה מאוחרת יותר."
+OFFER_REPLACED = "↩️ הקוד הוחלף בקוד חדש, בהודעה מאוחרת יותר."
 OFFER_EXPIRED = "⏱ תוקף הקוד פג. לקבלת קוד חדש שלחו כאן /link."
 
 
