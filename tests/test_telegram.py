@@ -153,6 +153,12 @@ def wa_receipts(mid):
         return [m for m in WA_SENT if m.get("status") == "read" and m.get("message_id") == mid]
 
 
+def wa_reactions(mid=None):
+    with LOCK:
+        return [m for m in WA_SENT if m.get("type") == "reaction"
+                and (mid is None or m.get("reaction", {}).get("message_id") == mid)]
+
+
 def tg_calls(method, chat=None):
     with LOCK:
         return [d for m, d in TG_CALLS if m == method and (chat is None or str(d.get("chat_id")) == str(chat))]
@@ -299,10 +305,10 @@ def main():
         check("WhatsApp 'link <code>' links the number (Telegram told, masked)",
               "+972…001" in tg_to("111")[-1]["text"] and "מקושר" in tg_to("111")[-1]["text"], tg_to("111")[-1])
         time.sleep(1.5)
-        wait_for(lambda: wa_texts("972500000001"), 10)
-        check("...and WhatsApp gets exactly one reply: keep sending here, transcripts go to Telegram",
-              len(wa_texts("972500000001")) == 1 and "מקושר לטלגרם" in wa_texts("972500000001")[0]["text"]["body"],
-              wa_texts("972500000001"))
+        wait_for(lambda: wa_reactions(mid), 10)
+        check("...WhatsApp gets a thumbs up reaction and no confirmation text",
+              wa_reactions(mid) and wa_reactions(mid)[0].get("reaction", {}).get("emoji") == "👍"
+              and not wa_texts("972500000001"))
         check("...and the link message was marked read", wa_receipts(mid))
 
         n_wa = len(wa_texts("972500000001"))
@@ -371,12 +377,14 @@ def main():
               "מקושר" not in tg_to("445")[-1]["text"] and not q("SELECT 1 FROM identities WHERE address = '445' "
                                                                "AND user_id IN (SELECT user_id FROM identities WHERE channel = 'whatsapp')"))
         n = len(wa_texts("972500000004"))
-        wa("972500000004", "text", text=f"link {t4}")
+        mid4 = wa("972500000004", "text", text=f"link {t4}")
         wait_for(lambda: len(tg_to("444")) >= 2)
         time.sleep(1.5)
         check("the Telegram-first link works for this number", "+972…004" in tg_to("444")[-1]["text"])
-        check("...with its one WhatsApp reply", len(wa_texts("972500000004")) == n + 1
-              and "מקושר לטלגרם" in wa_texts("972500000004")[-1]["text"]["body"], wa_texts("972500000004")[n:])
+        wait_for(lambda: wa_reactions(mid4), 10)
+        check("...with a thumbs up reaction and no text reply on WhatsApp",
+              wa_reactions(mid4) and wa_reactions(mid4)[0].get("reaction", {}).get("emoji") == "👍"
+              and len(wa_texts("972500000004")) == n)
 
         # ===== 11: re-linking to another chat tells the old one
         tg("555", text="/link")
@@ -453,13 +461,13 @@ def main():
         tg("777", text="/link")
         wait_for(lambda: tg_to("777"))
         t7 = token_from(tg_to("777"))
-        wa("972500000009", "text", text=f"link {t7}")
+        mid7 = wa("972500000009", "text", text=f"link {t7}")
         wait_for(lambda: len(tg_to("777")) >= 2)
         check("linking still works under drop", "מקושר" in tg_to("777")[-1]["text"])
-        wait_for(lambda: wa_texts("972500000009"), 10)
-        check("...with one WhatsApp confirmation, even while WhatsApp replies are off",
-              len(wa_texts("972500000009")) == 1 and "מקושר לטלגרם" in wa_texts("972500000009")[0]["text"]["body"],
-              wa_texts("972500000009"))
+        wait_for(lambda: wa_reactions(mid7), 10)
+        check("...with thumbs up confirmation and no WhatsApp text reply, even while WhatsApp replies are off",
+              wa_reactions(mid7) and wa_reactions(mid7)[0].get("reaction", {}).get("emoji") == "👍"
+              and not wa_texts("972500000009"))
         wa("972500000009")
         wait_for(lambda: any(m["text"] == "hello world" for m in tg_to("777")), 30)
         check("...and its voice notes reach Telegram", any(m["text"] == "hello world" for m in tg_to("777")))

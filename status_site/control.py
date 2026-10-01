@@ -9,8 +9,8 @@ single-use and expire after 15 minutes.
 The Notifier app links the other way round: it shows the code, and the user sends
 "link <code>" from WhatsApp (or Telegram). Its codes are ten characters to Telegram's
 eight, which is how the two are told apart. The outcome shows in the app. Either way, a
-successful link from WhatsApp earns exactly one WhatsApp reply saying where transcripts
-go now; a failed one gets only the free read receipt.
+successful link from WhatsApp earns an emoji reaction (and read receipt)
+on the link message; a failed one gets only the free read receipt.
 """
 
 import os
@@ -27,7 +27,8 @@ import whatsapp
 
 ADMIN_CHAT_IDS = {c.strip() for c in os.environ.get("ADMIN_TG_CHAT_IDS", "").split(",") if c.strip()}
 
-LINK_WITH_CODE = re.compile(r"^\s*link\s+([0-9a-z]{8})\s*$", re.IGNORECASE)
+TELEGRAM_CODE = re.compile(r"^\s*link\s+([0-9a-z]{8})\s*$", re.IGNORECASE)
+LINK_WITH_CODE = TELEGRAM_CODE  # backwards-compatibility alias
 # "link ABCDE-FGHJK" as typed or prefilled, "/link ABCDE-FGHJK" in Telegram, and
 # "link-ABCDEFGHJK" from a t.me/...?start= deep link.
 NOTIFIER_CODE = re.compile(r"^\s*/?link[\s-]+([0-9a-z]{5})-?([0-9a-z]{5})\s*$", re.IGNORECASE)
@@ -45,7 +46,7 @@ def _chats(cur, user_id):
     return [i["address"] for i in identity.identities_of(cur, user_id) if i["channel"] == "telegram"]
 
 
-def _link_whatsapp(cur, user_id, number, sent_at):
+def _link_whatsapp_to_telegram(cur, user_id, number, sent_at, message_id=None):
     """Move a WhatsApp number into user_id (a Telegram chat's user), and tell everyone
     concerned. The caller has checked the region."""
     previous = identity.user_of(cur, "whatsapp", number)
@@ -64,8 +65,11 @@ def _link_whatsapp(cur, user_id, number, sent_at):
         outbox.enqueue_text(cur, _tg(chat), messages.tg_moved_away(masked), sent_at)
     for chat in _chats(cur, user_id):
         outbox.enqueue_text(cur, _tg(chat), messages.tg_linked(masked), sent_at)
-    # One billed WhatsApp reply, so the user knows to keep sending recordings there.
-    _tell_whatsapp(cur, number, messages.WA_LINKED_TELEGRAM, sent_at)
+    if message_id:
+        _tell_whatsapp(cur, number, message_id, sent_at)
+
+
+_link_whatsapp = _link_whatsapp_to_telegram  # backwards-compatibility alias
 
 
 # --- Notifier
@@ -82,10 +86,10 @@ def is_notifier_link(text):
     return notifier_code(text) is not None
 
 
-def handle_notifier_link(cur, channel, address, code, sent_at):
+def handle_notifier_link(cur, channel, address, code, sent_at, message_id=None):
     """Redeeming takes a call to the Notifier, so it is queued; notifier_redeemed
     finishes the job."""
-    outbox.enqueue_link(cur, code, {"channel": channel, "address": str(address)}, sent_at)
+    outbox.enqueue_link(cur, code, {"channel": channel, "address": str(address), "message_id": message_id}, sent_at)
 
 
 def notifier_label(owner):
@@ -114,37 +118,53 @@ def notifier_redeemed(cur, owner, status, subscription_id, sent_at):
                         messages.notifier_welcome(channel, masked), sent_at, meta={"kind": "welcome"})
     for chat in _chats(cur, user_id):
         outbox.enqueue_text(cur, _tg(chat), messages.TG_NOTIFIER_LINKED, sent_at)
-    if channel == "whatsapp":
-        _tell_whatsapp(cur, address, messages.WA_LINKED_COMMUNICATOR, sent_at)
+    if channel == "whatsapp" and owner.get("message_id"):
+        _tell_whatsapp(cur, address, owner["message_id"], sent_at)
 
 
-def _tell_whatsapp(cur, number, text, sent_at):
-    """The single WhatsApp message a successful link earns: billed, so exactly one."""
-    outbox.enqueue_text(cur, {"channel": "whatsapp", "address": str(number), "quote": None}, text,
-                        sent_at, billed_notice=True)
+def _tell_whatsapp(cur, number, message_id, sent_at, emoji="👍"):
+    """React to the link message with an emoji thumbs up (free of charge on WhatsApp)."""
+    if not message_id:
+        return
+    outbox.enqueue_reaction(cur, {"channel": "whatsapp", "address": str(number), "quote": message_id},
+                            emoji, sent_at)
 
 
 def _outputs(cur, user_id, channel):
     return [i["address"] for i in identity.identities_of(cur, user_id) if i["channel"] == channel]
 
 
-# --- WhatsApp
+# --- Telegram linking (from WhatsApp)
 
-def is_whatsapp_link(text):
-    return bool(text and LINK_WITH_CODE.match(text))
+def telegram_code(text):
+    """The 8-character Telegram link code in text, canonical, or None."""
+    if not text:
+        return None
+    match = TELEGRAM_CODE.match(text)
+    return match.group(1).upper() if match else None
 
 
-def handle_whatsapp_link(cur, parsed, sent_at):
-    """"link <code>" from WhatsApp. Outcomes are reported in Telegram, where the code
-    came from; a success also gets one WhatsApp reply, and a wrong code none, since any
-    WhatsApp reply is billed."""
+def is_telegram_link(text):
+    return telegram_code(text) is not None
+
+
+def handle_telegram_link(cur, parsed, sent_at):
+    """"link <code>" from WhatsApp to link with a Telegram chat. Outcomes are reported
+    in Telegram, where the code came from; a success gets a thumbs up reaction on WhatsApp,
+    and a wrong code none."""
     number = parsed["sender"]
-    status, user_id = identity.consume_token(cur, LINK_WITH_CODE.match(parsed["text"]).group(1))
+    code = telegram_code(parsed["text"])
+    status, user_id = identity.consume_token(cur, code)
     if status == "ok" and limits.is_allowed_region(number):
-        _link_whatsapp(cur, user_id, number, sent_at)
+        _link_whatsapp_to_telegram(cur, user_id, number, sent_at, message_id=parsed.get("message_id"))
     elif status == "expired":
         for chat in _chats(cur, user_id):
             outbox.enqueue_text(cur, _tg(chat), messages.TG_LINK_EXPIRED, sent_at)
+
+
+# Backwards-compatibility aliases
+is_whatsapp_link = is_telegram_link
+handle_whatsapp_link = handle_telegram_link
 
 
 # --- Telegram

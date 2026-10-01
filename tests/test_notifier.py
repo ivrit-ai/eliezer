@@ -168,6 +168,12 @@ def wa_receipts(mid):
         return [m for m in WA_SENT if m.get("status") == "read" and m.get("message_id") == mid]
 
 
+def wa_reactions(mid=None):
+    with LOCK:
+        return [m for m in WA_SENT if m.get("type") == "reaction"
+                and (mid is None or m.get("reaction", {}).get("message_id") == mid)]
+
+
 # ---------------------------------------------------------------- hub I/O
 def http(method, path, body=None, headers=None, raw=None, timeout=30):
     data = raw if raw is not None else (json.dumps(body).encode() if body is not None else None)
@@ -284,9 +290,10 @@ def main():
         welcome = nt_to("sub-abcdefghjk", "welcome")[0]
         check("a welcome notification confirms it, in Hebrew", "אליעזר מקושר" in welcome["body"], welcome)
         time.sleep(1)
-        wait_for(lambda: wa_texts(num), 10)
-        check("...WhatsApp gets exactly one reply: keep sending here, transcripts go to the app",
-              len(wa_texts(num)) == 1 and "Communicator" in wa_texts(num)[0]["text"]["body"], wa_texts(num))
+        wait_for(lambda: wa_reactions(mid), 10)
+        check("...WhatsApp gets a thumbs up reaction and no confirmation text",
+              wa_reactions(mid) and wa_reactions(mid)[0].get("reaction", {}).get("emoji") == "👍"
+              and not wa_texts(num))
         check("...just the free read receipt", wa_receipts(mid))
 
         # ===== transcripts go to the Notifier, not WhatsApp
@@ -303,15 +310,16 @@ def main():
         check("...no nudge rides along as a separate notification (NUDGE_INTERVAL=1)",
               len(nt_to("sub-abcdefghjk", "transcript")) == 1 and len(nt_to("sub-abcdefghjk")) == 2,
               nt_to("sub-abcdefghjk"))
-        check("...and nothing more on WhatsApp", len(wa_texts(num)) == 1, wa_texts(num))
+        check("...and nothing more on WhatsApp", len(wa_texts(num)) == 0, wa_texts(num))
 
         # ===== a code that will never work
         num2 = "972500000002"
         CODES["ZZZZZZZZZZ"] = "expired"
-        wa(num2, "text", text="link ZZZZZ-ZZZZZ")
+        mid2 = wa(num2, "text", text="link ZZZZZ-ZZZZZ")
         wait_for(lambda: any(r["code"] == "ZZZZZZZZZZ" for r in REDEEMS))
         time.sleep(1.5)
         check("an expired code from WhatsApp gets no WhatsApp answer", not wa_texts(num2), wa_texts(num2))
+        check("...and no reaction on WhatsApp", not wa_reactions(mid2))
         check("...and links nothing", not q("SELECT 1 FROM identities WHERE channel = 'notifier' AND address LIKE 'sub-zz%%'"))
 
         # ===== from Telegram, by deep link

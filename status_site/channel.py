@@ -5,7 +5,7 @@ output-only, and provides just the replies part (its send_text also takes meta a
 dedupe_key):
   webhooks: verify_registration(args), verify_payload(raw, headers), split(payload), parse(body)
   replies:  target(parsed), MAX_TEXT_LENGTH, send_text(address, text, quote, buttons),
-            send_receipt(address, message_id, typing)
+            send_receipt(address, message_id, typing), send_reaction(address, message_id, emoji)
   media:    open_media(media)
 and raises SendError from its send functions.
 """

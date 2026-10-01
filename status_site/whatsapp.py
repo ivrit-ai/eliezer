@@ -160,6 +160,23 @@ def send_receipt(address, message_id, typing=False):
     return _post(data)
 
 
+def send_reaction(address, message_id, emoji="👍"):
+    """React to a message with an emoji. Free of charge on WhatsApp Cloud API."""
+    if not (address and message_id and emoji):
+        return None
+    data = {
+        "messaging_product": "whatsapp",
+        "recipient_type": "individual",
+        "to": address,
+        "type": "reaction",
+        "reaction": {
+            "message_id": message_id,
+            "emoji": emoji,
+        },
+    }
+    return _post(data)
+
+
 # --- registration
 
 _display_number = None

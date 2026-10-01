@@ -140,6 +140,22 @@ def enqueue_receipt(cur, target, typing, sent_at):
     _wakeup.set()
 
 
+def enqueue_reaction(cur, target, emoji, sent_at):
+    """Queue an emoji reaction for target's message (target['quote']). Reactions are
+    status updates, not billed messages on WhatsApp."""
+    if not (target.get("address") and target.get("quote") and emoji):
+        return
+    cur.execute(
+        """
+        INSERT INTO outbox (channel, address, action, payload, sent_at)
+        VALUES (%s, %s, 'reaction', %s, to_timestamp(%s));
+        """,
+        (target["channel"], target["address"],
+         json.dumps({"message_id": target["quote"], "emoji": emoji}), sent_at),
+    )
+    _wakeup.set()
+
+
 def sweep_expired(cur, max_age_seconds):
     """Drop replies still unsent past the max age. Returns how many."""
     cur.execute(
@@ -185,6 +201,10 @@ def _deliver(row):
     adapter = CHANNELS[row["channel"]]
     if row["action"] == "link":
         _redeem(row)
+        return
+    if row["action"] == "reaction":
+        if hasattr(adapter, "send_reaction"):
+            adapter.send_reaction(row["address"], row["payload"]["message_id"], row["payload"]["emoji"])
         return
     if row["action"] != "text":
         adapter.send_receipt(row["address"], row["payload"]["message_id"], row["action"] == "typing")
@@ -240,7 +260,7 @@ def _send_one(row):
             _execute("DELETE FROM outbox WHERE channel = %s AND address = %s;",
                      (row["channel"], row["address"]))
             return
-        if row["action"] in ("text", "link") and e.retryable:
+        if row["action"] in ("text", "link", "reaction") and e.retryable:
             delay = e.retry_after or min(5 * 2 ** (row["attempts"] - 1), MAX_BACKOFF_SECONDS)
             log.debug("outbox %s to %s:%s failed (%s); retry in %ss",
                       row["id"], row["channel"], row["address"], e, delay)

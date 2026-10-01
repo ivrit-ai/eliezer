@@ -184,6 +184,22 @@ def send_receipt(address, message_id, typing=False):
     return None
 
 
+def send_reaction(address, message_id, emoji="👍"):
+    """Set an emoji reaction on a message in Telegram."""
+    if not (address and message_id and emoji):
+        return None
+    try:
+        mid = int(message_id)
+    except (ValueError, TypeError):
+        return None
+    payload = {
+        "chat_id": address,
+        "message_id": mid,
+        "reaction": [{"type": "emoji", "emoji": emoji}],
+    }
+    return _call("setMessageReaction", payload)
+
+
 # --- media
 
 _http = None

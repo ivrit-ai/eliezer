@@ -88,7 +88,7 @@ TG_CHAT_UNLINKED = (
     "הם ממשיכים להגיע לאפליקציית Communicator; את הקישור אליה מבטלים מתוך האפליקציה."
 )
 
-# The one WhatsApp reply to a successful link: where the transcripts go from now on.
+# Legacy WhatsApp link replies (successful linking is now confirmed via thumbs-up emoji reaction).
 WA_LINKED_TELEGRAM = (
     "✅ הוואטסאפ שלכם מקושר לטלגרם.\n"
     "אפשר להמשיך לשלוח לאליעזר הקלטות כאן בוואטסאפ, כרגיל. התמלולים יגיעו אליכם בטלגרם."
