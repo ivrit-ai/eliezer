@@ -140,7 +140,7 @@ def wa_texts(to, notices=False):
                 and m["text"]["body"].startswith(NOTICE) == notices]
 
 
-DROPPED = "שלום,\n\nלצערנו, בגלל שינוי המחירים בוואטסאפ"
+DROPPED = "שלום,\n\nבגלל שינוי המחירים בוואטסאפ"
 
 
 def all_wa_texts(to):
