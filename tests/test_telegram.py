@@ -51,6 +51,7 @@ def free_port():
 LOCK = threading.Lock()
 MEDIA = {}                 # id -> (path, mime)   (WhatsApp media ids and Telegram file ids)
 WA_SENT, TG_SENT, TG_CALLS = [], [], []
+_message_ids = iter(range(5000, 10 ** 9))
 TG_FORBIDDEN = set()       # chat ids answering 403
 FILE_FAIL = {}             # file_id -> status codes its downloads return first, in order
 
@@ -117,12 +118,13 @@ class Telegram(Base):
                 if str(data["chat_id"]) in TG_FORBIDDEN:
                     return self._json(403, {"ok": False, "error_code": 403,
                                             "description": "Forbidden: bot was blocked by the user"})
+                data["_id"] = next(_message_ids)
                 TG_SENT.append(data)
         if method == "getMe":
             return self._json(200, {"ok": True, "result": {"id": 1, "username": "EliezerTestBot"}})
         if method == "getFile":
             return self._json(200, {"ok": True, "result": {"file_path": data["file_id"]}})
-        self._json(200, {"ok": True, "result": {"message_id": 1} if method == "sendMessage" else True})
+        self._json(200, {"ok": True, "result": {"message_id": data.get("_id", 1)} if method == "sendMessage" else True})
 
 
 def tg_to(chat):
@@ -356,6 +358,37 @@ def main():
         wait_for(lambda: wa_reactions(mid3), 10)
         check("...and gets a thumbs down on WhatsApp",
               wa_reactions(mid3) and wa_reactions(mid3)[0].get("reaction", {}).get("emoji") == "👎", wa_reactions(mid3))
+
+        # ===== offers: a code's message loses its button once used, replaced or expired
+        def edits_of(chat, message_id):
+            return [d for d in tg_calls("editMessageText", chat) if d.get("message_id") == message_id]
+        tg("901", text="/link")
+        wait_for(lambda: tg_to("901"))
+        first = tg_to("901")[-1]
+        time.sleep(0.5)
+        tg("901", text="/link")
+        wait_for(lambda: len(tg_to("901")) >= 2)
+        wait_for(lambda: edits_of("901", first["_id"]), 10)
+        edit = (edits_of("901", first["_id"]) or [{}])[0]
+        check("asking for a new code edits the old offer: replaced, button gone",
+              "הוחלף" in edit.get("text", "") and "reply_markup" not in edit, edit)
+        second = tg_to("901")[-1]
+        time.sleep(0.5)
+        wa("972500000091", "text", text=f"link {token_from([second])}")
+        wait_for(lambda: edits_of("901", second["_id"]), 10)
+        edit = (edits_of("901", second["_id"]) or [{}])[0]
+        check("a used code's offer says it was used", "נוצל" in edit.get("text", "") and "reply_markup" not in edit, edit)
+        tg("902", text="/link")
+        wait_for(lambda: tg_to("902"))
+        third = tg_to("902")[-1]
+        time.sleep(0.5)
+        q("UPDATE link_tokens SET expires_at = now() - interval '1 minute' WHERE token = %s RETURNING token",
+          token_from([third]))
+        wait_for(lambda: edits_of("902", third["_id"]), 15)
+        edit = (edits_of("902", third["_id"]) or [{}])[0]
+        check("an expired code's offer says so and tells how to get a new one",
+              "פג" in edit.get("text", "") and "/link" in edit.get("text", "") and "reply_markup" not in edit, edit)
+        check("...keeping the rest of the message", "אליעזר" in edit.get("text", ""), edit)
 
         # ===== 9: /unlink returns the number to WhatsApp
         tg("111", text="/unlink")

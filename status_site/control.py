@@ -20,6 +20,7 @@ import identity
 import limits
 import messages
 import notifier
+import offers
 import outbox
 import queue_api
 import stats
@@ -160,6 +161,7 @@ def handle_telegram_link(cur, parsed, sent_at):
     status, user_id = identity.consume_token(cur, code)
     if status == "ok" and limits.is_allowed_region(number):
         _link_whatsapp_to_telegram(cur, user_id, number, sent_at, message_id=parsed.get("message_id"))
+        offers.retire(cur, [code], "used", sent_at)
         return
     if status == "expired":
         for chat in _chats(cur, user_id):
@@ -175,6 +177,8 @@ handle_whatsapp_link = handle_telegram_link
 # --- Telegram
 
 def _offer_link(cur, chat, user_id, sent_at, quote=None):
+    # Minting cancels the user's earlier codes, so their messages say so.
+    offers.retire(cur, identity.live_tokens(cur, user_id), "replaced", sent_at)
     token = identity.mint_token(cur, user_id)
     numbers = _numbers(cur, user_id)
     text = (messages.tg_already_linked([identity.mask("whatsapp", n) for n in numbers])
@@ -184,7 +188,7 @@ def _offer_link(cur, chat, user_id, sent_at, quote=None):
         url = f"https://wa.me/{whatsapp.display_number()}?text=link%20{token}"
         buttons = [{"text": messages.LINK_BUTTON, "url": url}]
     outbox.enqueue_text(cur, _tg(chat, quote), text + messages.tg_link_code_hint(token), sent_at,
-                        buttons=buttons)
+                        buttons=buttons, offer={"token": token, "base_text": text})
 
 
 def handle_telegram_text(cur, parsed, sent_at):

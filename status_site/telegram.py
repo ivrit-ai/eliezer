@@ -177,6 +177,18 @@ def send_text(address, text, quote=None, buttons=None):
     return _call("sendMessage", payload)
 
 
+def edit_text(address, message_id, text):
+    """Replace a message's text. Without reply_markup, Telegram drops its buttons."""
+    try:
+        return _call("editMessageText", {"chat_id": address, "message_id": message_id, "text": text,
+                                         "link_preview_options": {"is_disabled": True}})
+    except SendError as e:
+        # Already says this (an edit retried after it landed): done.
+        if "message is not modified" in str(e):
+            return None
+        raise
+
+
 def send_receipt(address, message_id, typing=False):
     # Telegram shows no read receipts to users; only the typing indicator is worth sending.
     if typing:

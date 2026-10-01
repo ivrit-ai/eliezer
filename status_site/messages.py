@@ -56,6 +56,12 @@ TG_WELCOME = (
 LINK_BUTTON = "קישור לוואטסאפ"
 
 
+# What an offer message says once its code can no longer be used (see offers.py).
+OFFER_USED = "✅ הקוד נוצל והקישור הושלם."
+OFFER_REPLACED = "↩️ הקוד הזה הוחלף בקוד חדש, בהודעה מאוחרת יותר."
+OFFER_EXPIRED = "⏱ תוקף הקוד פג. לקבלת קוד חדש שלחו כאן /link."
+
+
 def tg_link_code_hint(token):
     return (
         f"\n\nאם הכפתור לא עובד, שלחו לאליעזר בוואטסאפ את ההודעה: link {token}"

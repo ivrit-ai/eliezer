@@ -111,12 +111,13 @@ class Telegram(Base):
         data = self._body()
         if method == "sendMessage":
             with LOCK:
+                data["_id"] = len(TG_SENT) + 5000
                 TG_SENT.append(data)
         if method == "getMe":
             return self._json(200, {"ok": True, "result": {"id": 1, "username": "EliezerTestBot"}})
         if method == "getFile":
             return self._json(200, {"ok": True, "result": {"file_path": data["file_id"]}})
-        self._json(200, {"ok": True, "result": {"message_id": 1} if method == "sendMessage" else True})
+        self._json(200, {"ok": True, "result": {"message_id": data.get("_id", 1)} if method == "sendMessage" else True})
 
 
 class Notifier(Base):

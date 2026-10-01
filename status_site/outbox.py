@@ -73,11 +73,13 @@ def split_text(channel, text, quote):
 
 
 def enqueue_text(cur, target, text, sent_at, extra=(), source_handle=None, buttons=None,
-                 transcript=False, meta=None, billed_notice=False):
+                 transcript=False, meta=None, billed_notice=False, offer=None):
     """Queue a reply to target, in the caller's transaction. extra are further messages
     sent after it, unquoted (the nudge); buttons are links shown under the reply, where
     the channel supports them; meta describes it for channels that show more than text
-    (the Notifier: kind, subtitle). sent_at is when the user sent what this answers.
+    (the Notifier: kind, subtitle); offer ({token, base_text}) marks a Telegram link
+    offer, whose message id is recorded once sent (see offers.py). sent_at is when the
+    user sent what this answers.
 
     WhatsApp bills every message, so it gets transcripts (transcript=True) and nothing
     else: notices, refusals and command answers are dropped there, and still go out on
@@ -97,12 +99,27 @@ def enqueue_text(cur, target, text, sent_at, extra=(), source_handle=None, butto
         for part in parts:
             part["meta"] = meta
     parts += [{"text": e, "quote": None} for e in extra if e]
+    payload = {"parts": parts}
+    if offer:
+        payload["offer"] = offer
     cur.execute(
         """
         INSERT INTO outbox (channel, address, action, payload, sent_at, source_handle)
         VALUES (%s, %s, 'text', %s, to_timestamp(%s), %s);
         """,
-        (target["channel"], target["address"], json.dumps({"parts": parts}), sent_at, source_handle),
+        (target["channel"], target["address"], json.dumps(payload), sent_at, source_handle),
+    )
+    _wakeup.set()
+
+
+def enqueue_edit(cur, target, message_id, text, sent_at):
+    """Queue replacing the text of a message the bot sent (dropping its buttons)."""
+    cur.execute(
+        """
+        INSERT INTO outbox (channel, address, action, payload, sent_at)
+        VALUES (%s, %s, 'edit', %s, to_timestamp(%s));
+        """,
+        (target["channel"], target["address"], json.dumps({"message_id": message_id, "text": text}), sent_at),
     )
     _wakeup.set()
 
@@ -202,6 +219,10 @@ def _deliver(row):
     if row["action"] == "link":
         _redeem(row)
         return
+    if row["action"] == "edit":
+        if hasattr(adapter, "edit_text"):
+            adapter.edit_text(row["address"], row["payload"]["message_id"], row["payload"]["text"])
+        return
     if row["action"] == "reaction":
         if hasattr(adapter, "send_reaction"):
             adapter.send_reaction(row["address"], row["payload"]["message_id"], row["payload"]["emoji"])
@@ -219,7 +240,15 @@ def _deliver(row):
             adapter.send_text(row["address"], part["text"], part.get("quote"), part.get("buttons"),
                               meta=part.get("meta"), dedupe_key=f"outbox:{row['id']}:{i}")
         else:
-            adapter.send_text(row["address"], part["text"], part.get("quote"), part.get("buttons"))
+            sent = adapter.send_text(row["address"], part["text"], part.get("quote"), part.get("buttons"))
+            offer = row["payload"].get("offer")
+            if offer and part.get("buttons") and isinstance(sent, dict) and sent.get("message_id"):
+                # The message with the link button: remembered, so it can be edited
+                # once its code is used, replaced or expired.
+                with db.pool().connection() as conn, conn.cursor() as cur:
+                    identity.record_offer(cur, row["address"], sent["message_id"],
+                                          offer["token"], offer["base_text"])
+                    conn.commit()
         # Record each part as it goes, so a retry after a failure resumes here.
         _execute("UPDATE outbox SET parts_sent = %s WHERE id = %s;", (i + 1, row["id"]))
         counter = SENT_COUNTERS.get(row["channel"])
@@ -260,7 +289,7 @@ def _send_one(row):
             _execute("DELETE FROM outbox WHERE channel = %s AND address = %s;",
                      (row["channel"], row["address"]))
             return
-        if row["action"] in ("text", "link", "reaction") and e.retryable:
+        if row["action"] in ("text", "link", "reaction", "edit") and e.retryable:
             delay = e.retry_after or min(5 * 2 ** (row["attempts"] - 1), MAX_BACKOFF_SECONDS)
             log.debug("outbox %s to %s:%s failed (%s); retry in %ss",
                       row["id"], row["channel"], row["address"], e, delay)

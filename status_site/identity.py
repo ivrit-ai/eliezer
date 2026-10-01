@@ -70,6 +70,21 @@ def init_identity_db(cur):
         );
         """
     )
+    # Telegram messages carrying a link code and its button, so that once the code is
+    # used, replaced or expired the message can be edited to say so (see offers.py).
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS link_offers (
+          chat_id    TEXT NOT NULL,
+          message_id BIGINT NOT NULL,
+          token      TEXT NOT NULL,
+          base_text  TEXT NOT NULL,
+          created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+          PRIMARY KEY (chat_id, message_id)
+        );
+        """
+    )
+    cur.execute("CREATE INDEX IF NOT EXISTS link_offers_token_idx ON link_offers (token);")
     # The dashboard's running count starts from whatever is already recorded.
     cur.execute("UPDATE totals SET wa_told = (SELECT count(*) FROM wa_told) WHERE id = 1;")
     # Until an admin says otherwise, WhatsApp works as it always has.
@@ -211,6 +226,20 @@ def consume_token(cur, token):
         return "expired", row["user_id"]
     cur.execute("DELETE FROM link_tokens WHERE token = %s;", (token.upper(),))
     return "ok", row["user_id"]
+
+
+def live_tokens(cur, user_id):
+    cur.execute("SELECT token FROM link_tokens WHERE user_id = %s;", (user_id,))
+    return [r["token"] for r in cur.fetchall()]
+
+
+def record_offer(cur, chat_id, message_id, token, base_text):
+    """The Telegram message that carried token, once it has been sent."""
+    cur.execute(
+        "INSERT INTO link_offers (chat_id, message_id, token, base_text) VALUES (%s, %s, %s, %s) "
+        "ON CONFLICT DO NOTHING;",
+        (str(chat_id), int(message_id), token, base_text),
+    )
 
 
 def sweep_tokens(cur):

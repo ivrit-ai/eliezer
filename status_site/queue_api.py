@@ -33,6 +33,7 @@ import db
 import identity
 import limits
 import messages
+import offers
 import outbox
 import stats
 import telegram
@@ -203,6 +204,7 @@ def sweep():
         )
         dropped = cur.fetchall()
         expired_replies = outbox.sweep_expired(cur, MAX_AGE_SECONDS)
+        offers.retire_expired(cur, time.time())
         identity.sweep_tokens(cur)
         cur.execute(
             "DELETE FROM ingest_seen "
