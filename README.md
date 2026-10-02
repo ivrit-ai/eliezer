@@ -21,6 +21,20 @@ python whatsapp_bot.py            # or transcribe on RunPod (needs RUNPOD_* in .
 `--num-workers N` sets concurrent transcriptions (default 1 with `--local`, else 10).
 `--overflow-handler N` makes the edge take work only while more than N jobs are waiting.
 
+## The status page FAQ
+
+The "שאלות נפוצות" section at the bottom of the status page comes from
+`status_site/faq.py`. Edit the `FAQ_TEXT` block there (a `q:` line, an `a:` line,
+`---` between entries) and redeploy. A question with an empty `a:` is not shown until
+someone writes the answer.
+
+To work on the page locally with mock statistics (no database or credentials):
+
+```bash
+pip install fastapi uvicorn
+python status_site/dev_server.py   # http://127.0.0.1:8000
+```
+
 ## The Communicator app
 
 Besides Telegram, the hub can deliver transcripts as push notifications through

@@ -12,6 +12,7 @@ import outbox
 import stats
 import telegram
 import whatsapp
+from faq import FAQ
 from ingest import webhooks
 from queue_api import (
     init_queue_db, install_shutdown_hook, queue_api, queue_depth, require_edge, start_sweeper,
@@ -113,6 +114,11 @@ app.include_router(webhooks)
 @app.get("/api/stats")
 def api_stats():
     return JSONResponse(stats.compute_stats(queue_depth()))
+
+
+@app.get("/api/faq")
+def api_faq():
+    return JSONResponse(FAQ)
 
 
 @app.get("/queue/edges")
