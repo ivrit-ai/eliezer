@@ -2,7 +2,7 @@
 
 Transcribes WhatsApp voice notes. Two parts:
 
-- **The status site** (`status_site/`, deployed as `eliezer-status` on xhostd) is the hub.
+- **The status site** (`status_site/`, deployed on xhostd) is the hub.
   It receives the WhatsApp webhook, queues voice notes, answers everything that isn't a
   transcription itself, and sends every reply. It holds all platform credentials and the
   per-user limits, and serves the fleet dashboard at https://status.eliezer.ivrit.ai.
@@ -34,6 +34,23 @@ To work on the page locally with mock statistics (no database or credentials):
 pip install fastapi uvicorn
 python status_site/dev_server.py   # http://127.0.0.1:8000
 ```
+
+## Deploying the status site to xhostd
+
+The status site (`status_site/`) runs on xhostd as a standalone app. Within this repository, the site's files reside in the `status_site/` directory, while the xhostd app repository expects those files directly at its repository root (so `status_site/install.sh` and `status_site/launch.sh` serve as the root build and launch scripts).
+
+To publish updates:
+
+1. **Commit and push** your changes to this repository.
+2. **Push the `status_site` subtree** to the xhostd git remote:
+   ```bash
+   git subtree push --prefix=status_site <xhostd-git-remote-url> master
+   ```
+   *(Alternatively, pull or clone the xhostd app repository, copy the updated files from `status_site/` into it, commit, and push to its `master` branch.)*
+3. **Trigger the deployment** on xhostd:
+   - Using the xhostd MCP / API: call `deploy(app_name="<app-name>", channel="prod", ref="master")`
+   - Or trigger a deploy of `master` via the xhostd console.
+4. **Verify the build and runtime logs** to confirm the container started and health checks pass.
 
 ## The Communicator app
 
