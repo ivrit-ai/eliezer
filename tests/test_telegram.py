@@ -474,10 +474,14 @@ def main():
               and "status.eliezer.ivrit.ai" in told[0]["text"]["body"], told)
         check("...no transcript, and no ticks", not wa_receipts(mid))
         mid = wa("972500000007")
-        wa("972500000007", "text", text="hello?")
+        mid_text = wa("972500000007", "text", text="hello?")
         time.sleep(3)
         check("...and never another: later messages get nothing at all",
               len(all_wa_texts("972500000007")) == 1 and not wa_receipts(mid), all_wa_texts("972500000007"))
+        wait_for(lambda: wa_reactions(mid), 10)
+        check("...a voice note while silent gets a ⚠️ reaction",
+              wa_reactions(mid) and wa_reactions(mid)[0].get("reaction", {}).get("emoji") == "⚠️", wa_reactions(mid))
+        check("...text message while silent gets no reaction", not wa_reactions(mid_text))
         check("...all counted as unlinked; the out-of-region number is ignored, but not as unlinked",
               q("SELECT dropped_unlinked FROM totals")[0][0] == before + 3)
         n = len(all_wa_texts("972500000001"))

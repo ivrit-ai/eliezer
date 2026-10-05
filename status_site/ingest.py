@@ -153,10 +153,13 @@ def _route(source, items):
                 # An unlinked WhatsApp user while WhatsApp replies are off: no reply, and
                 # no read receipt either, which would read as "seen and ignored" - except
                 # the first time, when the number is told once where transcripts went.
+                # When silent, a voice message gets a warning reaction so the sender has feedback.
                 counts["unlinked"] += 1
                 if source == "whatsapp" and identity.mark_wa_told(cur, parsed["sender"]):
                     outbox.enqueue_text(cur, {**default, "quote": None}, messages.WA_DROPPED_NOTICE,
                                         sent_at, billed_notice=True)
+                elif (parsed.get("kind") == "audio" or parsed.get("type") in ("audio", "voice")) and default.get("quote"):
+                    outbox.enqueue_reaction(cur, default, "⚠️", sent_at)
                 continue
             if source == "whatsapp" and (parsed["kind"] or parsed["type"] == "text"):
                 # Blue ticks cost nothing, and tell the user their message arrived even
