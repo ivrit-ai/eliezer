@@ -159,6 +159,8 @@ def main():
                APP_GOOGLE_CLIENT_IDS=CLIENT_ID,
                APP_GOOGLE_JWKS_URL=f"http://127.0.0.1:{certs.server_address[1]}/certs",
                APP_ORIGINS=APP_ORIGIN, USER_MAX_MESSAGES_PER_HOUR=str(PER_HOUR),
+               APP_TOKEN_ISSUER=APP_ORIGIN,
+               APP_TOKEN_JWKS_URL=f"http://127.0.0.1:{certs.server_address[1]}/certs",
                QUEUE_SWEEP_INTERVAL_SECONDS="1")
     hubdir = os.path.join(REPO, "status_site")
     subprocess.run([sys.executable, "-c", "import app; app.init_db(); app.init_queue_db()"],
@@ -261,6 +263,16 @@ def main():
         st, other = upload("dave", short, "audio/ogg", headers={**auth("dave"), "X-Upload-Id": "upload-0001-abcd"})
         check("the same upload id from another account is its own job",
               st == 202 and other["job_id"] != first["job_id"], (st, other))
+
+        # ===== the app's own session, for the same account
+        session = lambda **kw: auth("carol", iss=APP_ORIGIN, aud="ivrit-app", **kw)
+        st, body, _ = http("GET", "/app/v1/jobs", headers=session())
+        check("the app's session sees the account's jobs",
+              st == 200 and [j["job_id"] for j in json.loads(body)["jobs"]] == [first["job_id"]], (st, body[:200]))
+        st, _, _ = http("GET", "/app/v1/jobs", headers=auth("carol", iss=APP_ORIGIN, aud="someone-else"))
+        check("a session meant for others -> 401", st == 401, st)
+        st, _, _ = http("GET", "/app/v1/jobs", headers=session(ttl=-600))
+        check("an expired session -> 401", st == 401, st)
 
         st, body, _ = http("GET", "/app/v1/jobs", headers=auth("alice"))
         listing = json.loads(body)["jobs"] if st == 200 else []

@@ -35,6 +35,16 @@ GOOGLE_CLIENT_IDS = [c.strip() for c in os.environ.get("APP_GOOGLE_CLIENT_IDS", 
 GOOGLE_JWKS_URL = os.environ.get("APP_GOOGLE_JWKS_URL", "https://www.googleapis.com/oauth2/v3/certs")
 GOOGLE_ISSUERS = ["accounts.google.com", "https://accounts.google.com"]
 
+# The app's own sessions: issued by the app's server for a Google account it
+# verified, lasting months where Google's ID tokens last an hour. Accepted when
+# APP_TOKEN_ISSUER (the app's origin) is set, with keys at APP_TOKEN_JWKS_URL
+# (default: its /.well-known/jwks.json), for the same account (sub).
+APP_TOKEN_ISSUER = os.environ.get("APP_TOKEN_ISSUER", "").rstrip("/")
+APP_TOKEN_JWKS_URL = os.environ.get("APP_TOKEN_JWKS_URL") or (
+    f"{APP_TOKEN_ISSUER}/.well-known/jwks.json" if APP_TOKEN_ISSUER else ""
+)
+APP_TOKEN_AUDIENCE = "ivrit-app"
+
 # Where the app's pages are served from, for CORS (app.py).
 APP_ORIGINS = [o.strip() for o in os.environ.get("APP_ORIGINS", "https://app.ivrit.ai").split(",") if o.strip()]
 
@@ -174,40 +184,44 @@ def sweep(cur):
 
 # --- the app's API
 
-_jwks = None
+_jwks = {}
 
 
-def _signing_key(token):
-    global _jwks
-    if _jwks is None:
-        # Google rotates its keys; the client caches them and refetches on an unknown kid.
-        _jwks = jwt.PyJWKClient(GOOGLE_JWKS_URL, cache_keys=True, lifespan=3600)
-    return _jwks.get_signing_key_from_jwt(token).key
+def _signing_key(token, url):
+    if url not in _jwks:
+        # Keys rotate; the client caches them and refetches on an unknown kid.
+        _jwks[url] = jwt.PyJWKClient(url, cache_keys=True, lifespan=3600)
+    return _jwks[url].get_signing_key_from_jwt(token).key
 
 
 def google_account(request: Request):
     """The Google account behind the request's ID token, or 401. Sync, so FastAPI runs
     it on the threadpool: fetching Google's keys is a blocking call."""
-    if not GOOGLE_CLIENT_IDS:
+    if not GOOGLE_CLIENT_IDS and not APP_TOKEN_ISSUER:
         raise HTTPException(status_code=503, detail="app sign-in not configured")
     header = request.headers.get("Authorization", "")
     token = header[len("Bearer "):] if header.startswith("Bearer ") else ""
     if not token:
         raise HTTPException(status_code=401, detail="sign-in required")
     try:
+        issuer = jwt.decode(token, options={"verify_signature": False}).get("iss")
+        session = bool(APP_TOKEN_ISSUER) and issuer == APP_TOKEN_ISSUER
+        if not session and not GOOGLE_CLIENT_IDS:
+            raise ValueError("not a session token")
         claims = jwt.decode(
             token,
-            _signing_key(token),
+            _signing_key(token, APP_TOKEN_JWKS_URL if session else GOOGLE_JWKS_URL),
             algorithms=["RS256"],
-            audience=GOOGLE_CLIENT_IDS,
-            issuer=GOOGLE_ISSUERS,
+            audience=APP_TOKEN_AUDIENCE if session else GOOGLE_CLIENT_IDS,
+            issuer=APP_TOKEN_ISSUER if session else GOOGLE_ISSUERS,
             options={"require": ["exp", "iat", "sub", "aud", "iss"]},
             leeway=60,
         )
     except Exception as e:
         log.info("app token rejected: %s", e)
         raise HTTPException(status_code=401, detail="sign-in required")
-    if claims.get("email") and not claims.get("email_verified"):
+    # The app's server issues sessions only for verified addresses.
+    if not session and claims.get("email") and not claims.get("email_verified"):
         raise HTTPException(status_code=401, detail="unverified email")
     return {"sub": str(claims["sub"]), "email": claims.get("email")}
 
