@@ -94,7 +94,7 @@ def main():
     time.sleep(1)
     dburl = f"postgresql://postgres:pw@127.0.0.1:{pg_port}/postgres"
     env = dict(os.environ, DATABASE_URL=dburl, QUEUE_TOKEN=QUEUE_TOKEN, APP_SERVER_TOKEN=TOKEN,
-               CREDIT_POOLS="runpod=3", FILE_LONG_SHARE="0.5", CREDIT_LEASE_SECONDS="4",
+               CREDIT_POOLS="runpod=3", FILE_LANE_CAPS="file_short=2,file_long=1", CREDIT_LEASE_SECONDS="4",
                QUEUE_SWEEP_INTERVAL_SECONDS="1", FILE_QUOTA_MINUTES_PER_WEEK="60",
                PORT=str(hub_port), WHATSAPP_GRAPH_URL="http://127.0.0.1:9", TELEGRAM_API_URL="http://127.0.0.1:9")
     hubdir = os.path.join(REPO, "status_site")
@@ -311,6 +311,14 @@ def main():
               (sorted(got), time.monotonic() - started))
         for grant in list(everything.values()) + list(got.values()):
             http("POST", "/credits/release", {"handle": grant["handle"]})
+
+        # --- exact lane caps (FILE_LANE_CAPS: two short at a time here), whatever is free
+        conn.execute("DELETE FROM queue_messages WHERE lane IN ('file_short', 'file_long', 'byok')")
+        for i in range(3):
+            register(f"cap-{i}", f"g:cap{i}", 60, charge=False)
+        capped = wait()
+        check("short files never run more at once than their lane allows",
+              sorted(capped) == ["cap-0", "cap-1"], sorted(capped))
     finally:
         hub.terminate()
         conn.close()

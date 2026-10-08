@@ -117,10 +117,10 @@ class WhatsAppBot:
         self.transcription_semaphore = threading.BoundedSemaphore(num_workers)
         self.overflow_handler = overflow_handler
         self.overflow_min_wait = overflow_min_wait
-        # On RunPod this edge draws on the site's "runpod" pool, which the app's file
-        # transcriptions share, so together they never send the endpoint more than it
-        # has workers for.
-        self.pool = None if local else (os.getenv('CREDIT_POOL', 'runpod') or None)
+        # On RunPod this edge can draw on one of the site's pools (CREDIT_POOL), when it
+        # shares its endpoint with the app's file transcriptions, so together they never
+        # send the endpoint more than it has workers for. Unset, it leases as before.
+        self.pool = None if local else (os.getenv('CREDIT_POOL') or None)
 
         # In-process queue: the dispatcher thread fills it from the message queue,
         # workers drain it. At most one buffered job per worker thread: a leased job's

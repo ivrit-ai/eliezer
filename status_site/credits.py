@@ -49,6 +49,12 @@ RUNPOD = "runpod"
 SHORT_SECONDS = float(os.environ.get("FILE_SHORT_SECONDS", "1200"))
 # The share of the RunPod pool long files may hold at once (at least one slot).
 LONG_SHARE = float(os.environ.get("FILE_LONG_SHARE", "0.7"))
+# Or exact caps per lane, "file_short=1,file_long=1": transcribe.ivrit.ai's own
+# limits on the endpoint (one short and one long file at a time).
+LANE_CAPS = {
+    lane.strip(): int(cap)
+    for lane, _, cap in (item.partition("=") for item in os.environ.get("FILE_LANE_CAPS", "").split(",") if "=" in item)
+}
 # How long a file may wait for a slot before it is given up on.
 FILE_MAX_AGE = int(os.environ.get("FILE_MAX_AGE_SECONDS", str(24 * 3600)))
 # A credit lapses this long after its last heartbeat.
@@ -186,16 +192,17 @@ def _grant(cur, lanes, pool, n, holder):
     if pool:
         capacity = _capacity(cur)
         free = capacity - queue_api.pool_in_use(cur, pool)
-        cur.execute(f"SELECT count(*) AS n FROM queue_messages WHERE pool = %s AND lane = %s AND {queue_api.LIVE};",
-                    (pool, LONG))
-        long_free = max(1, math.floor(capacity * LONG_SHARE)) - cur.fetchone()["n"]
+        cur.execute(f"SELECT lane, count(*) AS n FROM queue_messages WHERE pool = %s AND {queue_api.LIVE} GROUP BY lane;",
+                    (pool,))
+        running = {r["lane"]: r["n"] for r in cur.fetchall()}
+        caps = {SHORT: capacity, LONG: max(1, math.floor(capacity * LONG_SHARE)), **LANE_CAPS}
+        lane_free = {lane: caps.get(lane, capacity) - running.get(lane, 0) for lane in lanes}
         for c in candidates:
             if len(chosen) >= min(n, free):
                 break
-            if c["lane"] == LONG:
-                if long_free <= 0:
-                    continue
-                long_free -= 1
+            if lane_free.get(c["lane"], 0) <= 0:
+                continue
+            lane_free[c["lane"]] -= 1
             chosen.append((c["id"], pool))
     else:
         chosen = [(c["id"], f"byok:{c['owner']}") for c in candidates[:n]]
