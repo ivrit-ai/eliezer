@@ -66,3 +66,23 @@ the app instead of WhatsApp. The hub needs:
   if not `NOTIFIER_URL`.
 
 Without the first two the channel is off.
+
+## The ivrit.ai app
+
+The ivrit.ai Android app (`ai.ivrit.app`) sends audio shared into it straight to the
+hub, under the user's Google account, and fetches the result (`status_site/ivrit_app.py`):
+
+- `POST /app/v1/jobs`: the file as the body (`Content-Type` audio/* or video/*, name in
+  `X-Filename`), with `Authorization: Bearer <Google ID token>`. Answers 202 `{job_id}`.
+- `GET /app/v1/jobs/{job_id}` and `GET /app/v1/jobs`: `queued`, `done` with `text`, or
+  `failed` with `error` (`too_long`, `rate_limited` with `wait_minutes`,
+  `duration_failed`, `unsupported`, `expired`). Kept three days.
+
+Uploads are queued as source `app` and transcribed by the edges like any voice message,
+under the same 10-minute cap and hourly limits, counted per Google account. Results go
+to the app only, never to WhatsApp or Telegram. The hub needs:
+
+- `APP_GOOGLE_CLIENT_IDS`: the app's OAuth client id(s) an ID token must be issued to.
+  Without it the app's API answers 503.
+- `APP_ORIGINS` (optional): where the app's pages are served from, for CORS; default
+  `https://app.ivrit.ai`.

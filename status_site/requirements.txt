@@ -5,3 +5,4 @@ httpx
 requests
 phonenumbers
 posthog
+PyJWT[crypto]>=2.8

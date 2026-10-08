@@ -11,6 +11,7 @@ using real audio generated with ffmpeg.
 | `test_whatsapp.py` | The WhatsApp path end to end: media through the hub, admission (10-minute cap, fleet-wide rate limits), transcripts-only WhatsApp replies, the pricing notice, long replies, send retries and resumption, safe completion retries, statistics. |
 | `test_telegram.py` | Telegram, linking and admin: link flow, delivery to Telegram, the reply policy and allowlist, unlink and blocked bots, groups and `/transcribe`, group and sent-message counters, recovery from media failures. |
 | `test_notifier.py` | The Notifier app as an output: linking by code from WhatsApp and from a Telegram deep link, transcripts to the app instead of WhatsApp, a number moving to Telegram keeping its app, `/unlink` with an app linked, retries on 429, unbinding on 410, dashboard counters. |
+| `test_app.py` | The ivrit.ai app as a source: Google ID tokens (issuer, audience, expiry, signature, verified email), upload limits (type, 20 MB, three waiting per account), the real edge transcribing app uploads (direct and converted), refusals reported to the app (too long, unsupported, hourly limit per account), results only to the app (never the outbox), and CORS for the app's origin. |
 
 ## Running
 

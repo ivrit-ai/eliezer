@@ -31,6 +31,7 @@ from starlette.background import BackgroundTask
 import analytics
 import db
 import identity
+import ivrit_app
 import limits
 import messages
 import offers
@@ -59,7 +60,8 @@ MAX_WAIT_SECONDS = 20
 MAX_BATCH = 100
 
 # Platform adapters by queue source: parse(body), target(parsed), open_media(media).
-SOURCES = {"whatsapp": whatsapp, "telegram": telegram}
+# "app" is the ivrit.ai app, whose replies go to app_jobs rather than the outbox.
+SOURCES = {"whatsapp": whatsapp, "telegram": telegram, "app": ivrit_app}
 
 # A message an edge may take right now. Shared by lease, depth and the overflow
 # threshold, so all three agree on what "waiting" means.
@@ -148,6 +150,7 @@ def init_queue_db():
         )
         outbox.init_outbox_db(cur)
         identity.init_identity_db(cur)
+        ivrit_app.init_db(cur)
         conn.commit()
 
 
@@ -197,12 +200,14 @@ def sweep():
             DELETE FROM queue_messages
             WHERE sent_at < now() - make_interval(secs => %(age)s::double precision)
                OR (receive_count >= %(max)s AND visible_at <= now())
-            RETURNING id, source, receive_count,
+            RETURNING id, source, receive_count, job_id,
                       extract(epoch FROM now() - sent_at)::int AS age_seconds;
             """,
             _params(),
         )
         dropped = cur.fetchall()
+        ivrit_app.expire(cur, [r["job_id"] for r in dropped if r["source"] == "app"])
+        ivrit_app.sweep(cur)
         expired_replies = outbox.sweep_expired(cur, MAX_AGE_SECONDS)
         offers.retire_expired(cur, time.time())
         identity.sweep_tokens(cur)
@@ -437,15 +442,17 @@ def _admit(handle, duration, edge):
         if row is None:
             return None
         user = parsed["user_key"]
-        notice = None
+        app = row["source"] == "app"
+        notice = refusal = None
         if duration is None:
-            notice = messages.DURATION_FAILED
+            notice, refusal = messages.DURATION_FAILED, ("duration_failed", None)
         elif duration > limits.MAX_AUDIO_SECONDS:
-            notice = messages.TOO_LONG
+            notice, refusal = messages.TOO_LONG, ("too_long", None)
         else:
             allowed, has_resources_left, bucket = limits.admit(user, duration)
             if not allowed:
-                notice = messages.rate_limited(bucket.minutes_until_allowed(duration))
+                wait = bucket.minutes_until_allowed(duration)
+                notice, refusal = messages.rate_limited(wait), ("rate_limited", wait)
                 after.append(("rate-limit-hit", {
                     "user": user,
                     "messages_remaining": bucket.messages_remaining,
@@ -453,7 +460,12 @@ def _admit(handle, duration, edge):
                     "requested_duration": duration,
                     "job_id": row["job_id"],
                 }))
-        if notice:
+        if notice and app:
+            # The app shows its own words for these; it gets the reason, not our text.
+            ivrit_app.refuse(cur, parsed, *refusal)
+            cur.execute("DELETE FROM queue_messages WHERE id = %s;", (row["id"],))
+            ok = False
+        elif notice:
             _close_with_notice(cur, row, targets, notice)
             ok = False
         else:
@@ -461,8 +473,9 @@ def _admit(handle, duration, edge):
                 "UPDATE queue_messages SET admission = %s WHERE id = %s;",
                 (json.dumps({"duration": duration, "has_resources_left": has_resources_left}), row["id"]),
             )
-            for target in targets:
-                outbox.enqueue_receipt(cur, target, typing=True, sent_at=row["sent_at"])
+            if not app:
+                for target in targets:
+                    outbox.enqueue_receipt(cur, target, typing=True, sent_at=row["sent_at"])
             ok = True
         conn.commit()
     for event, props in after:
@@ -493,7 +506,7 @@ def _complete(handle, text, error, transcription_seconds, duration, edge):
         row, parsed, targets = _leased(cur, handle, lock=True)
         if row is None:
             cur.execute("SELECT 1 FROM outbox WHERE source_handle = %s;", (handle,))
-            return cur.fetchone() is not None
+            return cur.fetchone() is not None or ivrit_app.already_finished(cur, handle)
         user = parsed["user_key"]
         transcribed = error is None
         reply = text if transcribed else messages.ONLY_RECORDINGS
@@ -501,6 +514,10 @@ def _complete(handle, text, error, transcription_seconds, duration, edge):
         seconds = (row["admission"] or {}).get("duration") or duration
         meta = ({"kind": "transcript", "subtitle": messages.transcript_subtitle(seconds)}
                 if transcribed else {"kind": "notice"})
+        if row["source"] == "app":
+            # Fetched by the app, not sent: no outbox, no nudge, no notices.
+            ivrit_app.finish(cur, parsed, handle, text if transcribed else None, error, seconds)
+            targets = []
         for i, target in enumerate(targets):
             # Users still getting transcripts on WhatsApp are told WhatsApp now charges
             # for these messages, after each one - except allowlisted numbers, which
