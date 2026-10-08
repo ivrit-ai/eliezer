@@ -15,6 +15,7 @@ the same 10-minute cap and hourly buckets as everyone else.
 import json
 import logging
 import os
+import re
 import time
 import urllib.parse
 import uuid
@@ -71,6 +72,15 @@ def init_db(cur):
         """
     )
     cur.execute("CREATE INDEX IF NOT EXISTS app_jobs_user_idx ON app_jobs (google_sub, created_at DESC);")
+    # upload_id: the app's own id for an upload, so a re-send (the app died
+    # before it saw the answer) finds the job instead of making a second one.
+    # origin: where the recording was shared from ("whatsapp"), for the app.
+    cur.execute("ALTER TABLE app_jobs ADD COLUMN IF NOT EXISTS upload_id TEXT;")
+    cur.execute("ALTER TABLE app_jobs ADD COLUMN IF NOT EXISTS origin TEXT;")
+    cur.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS app_jobs_upload_idx ON app_jobs (google_sub, upload_id) "
+        "WHERE upload_id IS NOT NULL;"
+    )
 
 
 # --- the queue source (see channel.py)
@@ -212,6 +222,10 @@ def _view(row):
         "filename": row["filename"],
         "created_at": row["created_at"].timestamp(),
     }
+    if row["upload_id"]:
+        out["upload_id"] = row["upload_id"]
+    if row["origin"]:
+        out["origin"] = row["origin"]
     if row["status"] == "done":
         out["text"] = row["text"]
     if row["error"]:
@@ -225,17 +239,27 @@ def _view(row):
     return out
 
 
-VIEW_COLUMNS = "job_id, status, filename, text, error, wait_minutes, duration, created_at, finished_at"
+VIEW_COLUMNS = "job_id, status, filename, text, error, wait_minutes, duration, created_at, finished_at, upload_id, origin"
 
 
-def _submit(account, data, mime, filename):
+def _submit(account, data, mime, filename, upload_id, origin):
+    """The job for this upload: (row, created). None if too many are waiting."""
     # Imported here: queue_api imports this module for its SOURCES.
     import queue_api
 
     job_id = uuid.uuid4().hex
     with db.pool().connection() as conn, conn.cursor() as cur:
-        # One account at a time, so concurrent uploads cannot both pass the count.
+        # One account at a time, so concurrent uploads cannot both pass the count,
+        # nor two sends of one upload both make a job.
         cur.execute("SELECT pg_advisory_xact_lock(hashtext(%s));", (f"app:{account['sub']}",))
+        if upload_id:
+            cur.execute(
+                f"SELECT {VIEW_COLUMNS} FROM app_jobs WHERE google_sub = %s AND upload_id = %s;",
+                (account["sub"], upload_id),
+            )
+            existing = cur.fetchone()
+            if existing:
+                return existing, False
         cur.execute(
             "SELECT count(*) AS n FROM app_jobs WHERE google_sub = %s AND status = 'queued';",
             (account["sub"],),
@@ -243,19 +267,27 @@ def _submit(account, data, mime, filename):
         if cur.fetchone()["n"] >= MAX_PENDING:
             return None
         cur.execute(
-            "INSERT INTO app_jobs (job_id, google_sub, filename, mime, audio) VALUES (%s, %s, %s, %s, %s);",
-            (job_id, account["sub"], filename, mime, data),
+            "INSERT INTO app_jobs (job_id, google_sub, filename, mime, audio, upload_id, origin) "
+            f"VALUES (%s, %s, %s, %s, %s, %s, %s) RETURNING {VIEW_COLUMNS};",
+            (job_id, account["sub"], filename, mime, data, upload_id, origin),
         )
+        row = cur.fetchone()
         body = json.dumps({"job_id": job_id, "sub": account["sub"], "mime": mime})
         queue_api.enqueue(cur, "app", body, time.time(), job_id)
         conn.commit()
-    return job_id
+    return row, True
+
+
+UPLOAD_ID = re.compile(r"^[A-Za-z0-9-]{8,64}$")
+ORIGINS = {"whatsapp"}
 
 
 @app_api.post("/jobs")
 async def submit(request: Request, account: dict = Depends(google_account)):
-    """A clip to transcribe: the file itself as the body, its type as Content-Type and
-    its name (URL-encoded) in X-Filename. Answers 202 with the job's id."""
+    """A clip to transcribe: the file itself as the body, its type as Content-Type,
+    its name (URL-encoded) in X-Filename, and optionally the app's own id for this
+    upload in X-Upload-Id and where it was shared from in X-Origin. Answers 202 with
+    the job; a re-send of an upload already received, 200 with that same job."""
     mime = (request.headers.get("Content-Type") or "").split(";")[0].strip().lower()
     if not (mime.startswith("audio/") or mime.startswith("video/")):
         raise HTTPException(status_code=415, detail="audio or video only")
@@ -270,10 +302,15 @@ async def submit(request: Request, account: dict = Depends(google_account)):
     if not data:
         raise HTTPException(status_code=400, detail="empty")
     filename = urllib.parse.unquote(request.headers.get("X-Filename", ""))[:200] or None
-    job_id = await run_in_threadpool(_submit, account, bytes(data), mime, filename)
-    if job_id is None:
+    upload_id = request.headers.get("X-Upload-Id") or None
+    if upload_id and not UPLOAD_ID.match(upload_id):
+        raise HTTPException(status_code=400, detail="bad upload id")
+    origin = request.headers.get("X-Origin") if request.headers.get("X-Origin") in ORIGINS else None
+    result = await run_in_threadpool(_submit, account, bytes(data), mime, filename, upload_id, origin)
+    if result is None:
         raise HTTPException(status_code=429, detail="too many pending")
-    return JSONResponse({"job_id": job_id, "status": "queued"}, status_code=202)
+    row, created = result
+    return JSONResponse(_view(row), status_code=202 if created else 200)
 
 
 def _jobs(sub, job_id=None):

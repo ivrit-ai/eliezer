@@ -119,7 +119,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=ivrit_app.APP_ORIGINS,
     allow_methods=["GET", "POST"],
-    allow_headers=["Authorization", "Content-Type", "X-Filename"],
+    allow_headers=["Authorization", "Content-Type", "X-Filename", "X-Upload-Id", "X-Origin"],
     max_age=600,
 )
 

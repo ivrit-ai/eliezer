@@ -197,7 +197,7 @@ def main():
             st, _, _ = http("POST", "/app/v1/jobs", raw=b"0" * (20 * 1024 * 1024 + 1),
                             headers={**auth("alice"), "Content-Type": "audio/ogg"})
         except urllib.error.URLError as e:
-            st = "reset" if isinstance(e.reason, ConnectionResetError) else e
+            st = "reset" if isinstance(e.reason, (ConnectionResetError, BrokenPipeError)) else e
         check("over 20 MB -> refused", st in (413, "reset"), st)
 
         # ===== queued until an edge comes; at most three waiting per account
@@ -245,6 +245,22 @@ def main():
         st, body = upload("bob", short, "audio/ogg")
         d = finished("bob", body["job_id"])
         check("another account has its own limit", d and d["status"] == "done", d)
+
+        # ===== a re-sent upload (the app died before it saw the answer) is the same job
+        h = {**auth("carol"), "X-Upload-Id": "upload-0001-abcd", "X-Origin": "whatsapp"}
+        st, first = upload("carol", short, "audio/ogg", headers=h)
+        st2, again = upload("carol", short, "audio/ogg", headers=h)
+        check("first send of an upload -> 202", st == 202, (st, first))
+        check("a re-send -> 200, the same job", st2 == 200 and again["job_id"] == first["job_id"], (st2, again))
+        check("only one job made", q("SELECT count(*) FROM app_jobs WHERE google_sub = 'carol'")[0][0] == 1)
+        d = finished("carol", first["job_id"])
+        check("the job keeps its upload id and origin",
+              d and d.get("upload_id") == "upload-0001-abcd" and d.get("origin") == "whatsapp", d)
+        st, _ = upload("carol", short, "audio/ogg", headers={**auth("carol"), "X-Upload-Id": "x"})
+        check("a malformed upload id -> 400", st == 400, st)
+        st, other = upload("dave", short, "audio/ogg", headers={**auth("dave"), "X-Upload-Id": "upload-0001-abcd"})
+        check("the same upload id from another account is its own job",
+              st == 202 and other["job_id"] != first["job_id"], (st, other))
 
         st, body, _ = http("GET", "/app/v1/jobs", headers=auth("alice"))
         listing = json.loads(body)["jobs"] if st == 200 else []
