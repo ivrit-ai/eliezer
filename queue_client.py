@@ -51,13 +51,15 @@ class QueueClient:
                     raise
                 time.sleep(0.5 * (attempt + 1))
 
-    def lease(self, max_jobs, wait_seconds, min_depth=0):
+    def lease(self, max_jobs, wait_seconds, min_depth=0, pool=None, min_wait=0):
         """Up to max_jobs jobs, long-polling up to wait_seconds. Doubles as this edge's
-        heartbeat, so it carries the uptime."""
+        heartbeat, so it carries the uptime. An edge transcribing on RunPod names its
+        pool, so the site never hands it more than the endpoint has room for (the app's
+        files share it)."""
         return self._post(
             "/queue/lease",
-            {"max": max_jobs, "wait": wait_seconds, "min_depth": min_depth,
-             "uptime_seconds": time.time() - self.started},
+            {"max": max_jobs, "wait": wait_seconds, "min_depth": min_depth, "pool": pool,
+             "min_wait": min_wait, "uptime_seconds": time.time() - self.started},
             timeout=(5, wait_seconds + 15),
             retries=1,
         )["jobs"]

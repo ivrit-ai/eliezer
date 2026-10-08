@@ -88,7 +88,7 @@ IDLE_PROBE_INTERVAL = 10  # seconds the dispatcher waits when there is nothing t
 
 
 class WhatsAppBot:
-    def __init__(self, num_workers, local=False, overflow_handler=None, debug=False):
+    def __init__(self, num_workers, local=False, overflow_handler=None, debug=False, overflow_min_wait=0):
         self.queue = make_queue_client()
 
         # Initialize transcription model
@@ -116,6 +116,11 @@ class WhatsAppBot:
         self.num_worker_threads = 2 * num_workers
         self.transcription_semaphore = threading.BoundedSemaphore(num_workers)
         self.overflow_handler = overflow_handler
+        self.overflow_min_wait = overflow_min_wait
+        # On RunPod this edge draws on the site's "runpod" pool, which the app's file
+        # transcriptions share, so together they never send the endpoint more than it
+        # has workers for.
+        self.pool = None if local else (os.getenv('CREDIT_POOL', 'runpod') or None)
 
         # In-process queue: the dispatcher thread fills it from the message queue,
         # workers drain it. At most one buffered job per worker thread: a leased job's
@@ -311,7 +316,8 @@ class WhatsAppBot:
                 # server leases only what sits above the threshold, in the same call.
                 target = min(free, self.num_worker_threads)
                 jobs = self.queue.lease(
-                    target, 20, min_depth=self.overflow_handler or 0)
+                    target, 20, min_depth=self.overflow_handler or 0, pool=self.pool,
+                    min_wait=self.overflow_min_wait if self.overflow_handler else 0)
                 self.logger.debug(
                     f"Leased {len(jobs)} job(s), target {target}, "
                     f"overflow threshold {self.overflow_handler}")
@@ -417,6 +423,7 @@ if __name__ == "__main__":
     parser.add_argument('--num-workers', type=int, default=None, help='Number of concurrent transcriptions (default: 10, or 1 in --local mode); the bot runs 2x this many worker threads to overlap I/O')
     parser.add_argument('--local', action='store_true', help='Transcribe locally with faster-whisper instead of RunPod')
     parser.add_argument('--overflow-handler', type=int, default=None, metavar='N', help='Only handle jobs when the queue depth exceeds N')
+    parser.add_argument('--overflow-min-wait', type=int, default=0, metavar='S', help='In overflow mode, also handle jobs that have waited longer than S seconds')
     parser.add_argument('--debug', action='store_true', help='Enable debug logging (verbose output to console and file)')
     args = parser.parse_args()
 
@@ -436,6 +443,7 @@ if __name__ == "__main__":
         num_workers=num_workers,
         local=args.local,
         overflow_handler=args.overflow_handler,
+        overflow_min_wait=args.overflow_min_wait,
         debug=args.debug
     )
     bot.run()

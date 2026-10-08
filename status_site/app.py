@@ -9,6 +9,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
+import credits
 import ivrit_app
 import outbox
 import stats
@@ -113,6 +114,7 @@ app.mount("/static", StaticFiles(directory=os.path.join(BASE_DIR, "static")), na
 app.include_router(queue_api)
 app.include_router(webhooks)
 app.include_router(ivrit_app.app_api)
+app.include_router(credits.credits_api)
 # The ivrit.ai app's pages call /app/v1 from their own origin. Bearer tokens, no
 # cookies; and the queue's token is never in a browser, so opening the rest is moot.
 app.add_middleware(

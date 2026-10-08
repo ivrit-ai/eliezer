@@ -9,6 +9,12 @@ all platform I/O, limits, replies and statistics; edges hold no platform credent
 
 Messages are never kept: a message not handled within QUEUE_MAX_AGE_SECONDS of being
 *sent* is dropped - at ingest if it already is that old, otherwise by the sweeper.
+
+The same table schedules the ivrit.ai app's files (credits.py). Each row has a lane:
+"interactive" for voice messages and clips, which the edges lease here, and the file
+lanes, granted to the app's server as credits. Both draw on pools of transcription
+capacity (credit_pools): an edge leasing for RunPod names the "runpod" pool, so voice
+messages that spill over and files share one endpoint without overfilling it.
 """
 
 import asyncio
@@ -29,6 +35,7 @@ from psycopg.rows import dict_row
 from starlette.background import BackgroundTask
 
 import analytics
+import credits
 import db
 import identity
 import ivrit_app
@@ -59,17 +66,25 @@ SWEEP_INTERVAL_SECONDS = int(os.environ.get("QUEUE_SWEEP_INTERVAL_SECONDS", "60"
 MAX_WAIT_SECONDS = 20
 MAX_BATCH = 100
 
+# Voice messages and clips; the only lane edges lease.
+INTERACTIVE = "interactive"
+
 # Platform adapters by queue source: parse(body), target(parsed), open_media(media).
 # "app" is the ivrit.ai app, whose replies go to app_jobs rather than the outbox.
 SOURCES = {"whatsapp": whatsapp, "telegram": telegram, "app": ivrit_app}
 
 # A message an edge may take right now. Shared by lease, depth and the overflow
 # threshold, so all three agree on what "waiting" means.
-LEASABLE = """
+# expires_at is per lane (sent_at + the lane's max age); rows written before it existed
+# fall back to the voice-message max age.
+EXPIRES = "coalesce(expires_at, sent_at + make_interval(secs => %(age)s::double precision))"
+LEASABLE = f"""
     visible_at <= now()
     AND receive_count < %(max)s
-    AND sent_at >= now() - make_interval(secs => %(age)s::double precision)
+    AND {EXPIRES} > now()
 """
+# A lease (or credit) someone is holding right now.
+LIVE = "receipt_handle IS NOT NULL AND visible_at > now()"
 
 queue_api = APIRouter()
 
@@ -89,10 +104,85 @@ def install_shutdown_hook():
 
         def handler(signum, frame, previous=previous):
             _shutting_down.set()
+            # Waiting polls answer empty now, not after their next timer.
+            waker._wake()
             if callable(previous):
                 previous(signum, frame)
 
         signal.signal(sig, handler)
+
+
+class _Waker:
+    """Wakes long-polls when work may have appeared: a NOTIFY on queue_ready from any
+    transaction that queues a job or frees capacity. Waiters still re-check on a timer,
+    so a lost notification (or a dead listener) only costs latency."""
+
+    CHANNEL = "queue_ready"
+
+    def __init__(self):
+        self._loop = None
+        self._waiters = set()
+        self._started = threading.Lock()
+        self._running = False
+
+    def _listen(self):
+        while not _shutting_down.is_set():
+            try:
+                with psycopg.connect(db.DATABASE_URL, autocommit=True) as conn:
+                    conn.execute(f"LISTEN {self.CHANNEL};")
+                    while not _shutting_down.is_set():
+                        if any(True for _ in conn.notifies(timeout=5.0)):
+                            self._wake()
+            except Exception:
+                log.exception("queue listener failed; reconnecting")
+                time.sleep(5)
+
+    def _wake(self):
+        loop = self._loop
+        if loop is not None:
+            loop.call_soon_threadsafe(self._release)
+
+    def _release(self):
+        for event in self._waiters:
+            event.set()
+
+    async def wait(self, timeout):
+        if not self._running:
+            with self._started:
+                if not self._running:
+                    self._loop = asyncio.get_running_loop()
+                    threading.Thread(target=self._listen, name="QueueListener", daemon=True).start()
+                    self._running = True
+        event = asyncio.Event()
+        self._waiters.add(event)
+        try:
+            await asyncio.wait_for(event.wait(), timeout)
+        except asyncio.TimeoutError:
+            pass
+        finally:
+            self._waiters.discard(event)
+
+
+waker = _Waker()
+
+
+def notify(cur):
+    """Wake long-polls once this transaction commits."""
+    cur.execute(f"NOTIFY {_Waker.CHANNEL};")
+
+
+async def long_poll(attempt, wait):
+    """Call attempt() on the threadpool until it returns something or `wait` seconds pass."""
+    deadline = time.monotonic() + wait
+    result = None
+    # Checked before every attempt: once shutting down, take nothing new.
+    while not _shutting_down.is_set():
+        result = await run_in_threadpool(attempt)
+        remaining = deadline - time.monotonic()
+        if result or remaining <= 0:
+            break
+        await waker.wait(min(remaining, 2.0))
+    return result
 
 
 def _params(**extra):
@@ -128,10 +218,33 @@ def init_queue_db():
         cur.execute("ALTER TABLE queue_messages ADD COLUMN IF NOT EXISTS job_id TEXT;")
         cur.execute("ALTER TABLE queue_messages ADD COLUMN IF NOT EXISTS targets JSONB;")
         cur.execute("ALTER TABLE queue_messages ADD COLUMN IF NOT EXISTS admission JSONB;")
+        # The scheduling columns (see credits.py): which lane a job waits in, whose it
+        # is (fairness and per-owner caps), its spec for the holder, the pool its current
+        # lease or credit draws on, when it stops being worth doing, where the backend
+        # has it (so a re-grant reattaches instead of starting over), its progress, and
+        # whether its owner asked to stop it.
+        cur.execute("ALTER TABLE queue_messages ADD COLUMN IF NOT EXISTS lane TEXT NOT NULL DEFAULT 'interactive';")
+        cur.execute("ALTER TABLE queue_messages ADD COLUMN IF NOT EXISTS owner TEXT;")
+        cur.execute("ALTER TABLE queue_messages ADD COLUMN IF NOT EXISTS spec JSONB;")
+        cur.execute("ALTER TABLE queue_messages ADD COLUMN IF NOT EXISTS pool TEXT;")
+        cur.execute("ALTER TABLE queue_messages ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ;")
+        cur.execute("ALTER TABLE queue_messages ADD COLUMN IF NOT EXISTS backend_ref JSONB;")
+        cur.execute("ALTER TABLE queue_messages ADD COLUMN IF NOT EXISTS progress JSONB;")
+        cur.execute("ALTER TABLE queue_messages ADD COLUMN IF NOT EXISTS granted_at TIMESTAMPTZ;")
+        cur.execute(
+            "ALTER TABLE queue_messages ADD COLUMN IF NOT EXISTS cancel_requested BOOLEAN NOT NULL DEFAULT false;"
+        )
+        cur.execute(
+            "UPDATE queue_messages SET expires_at = sent_at + make_interval(secs => %s::double precision) "
+            "WHERE expires_at IS NULL;",
+            (MAX_AGE_SECONDS,),
+        )
         cur.execute(
             "CREATE INDEX IF NOT EXISTS queue_ready_idx "
             "ON queue_messages (visible_at, id);"
         )
+        cur.execute("CREATE INDEX IF NOT EXISTS queue_lane_idx ON queue_messages (lane, visible_at, id);")
+        cur.execute("CREATE INDEX IF NOT EXISTS queue_pool_idx ON queue_messages (pool) WHERE pool IS NOT NULL;")
         # Leases are looked up by handle on every edge call; without this it seq-scans,
         # which only hurts once a backlog has built up - exactly when it needs to be cheap.
         cur.execute(
@@ -151,6 +264,8 @@ def init_queue_db():
         outbox.init_outbox_db(cur)
         identity.init_identity_db(cur)
         ivrit_app.init_db(cur)
+        limits.init_db(cur)
+        credits.init_db(cur)
         conn.commit()
 
 
@@ -174,18 +289,43 @@ def count_dropped(cur, n):
         cur.execute("UPDATE totals SET dropped = dropped + %s WHERE id = 1;", (n,))
 
 
-def enqueue(cur, source, body, sent_at, job_id, targets=None):
+def enqueue(cur, source, body, sent_at, job_id, targets=None, lane=INTERACTIVE, owner=None,
+            spec=None, max_age=None):
     cur.execute(
-        "INSERT INTO queue_messages (source, body, sent_at, job_id, targets) "
-        "VALUES (%s, %s, to_timestamp(%s), %s, %s);",
-        (source, body, sent_at, job_id, json.dumps(targets) if targets else None),
+        "INSERT INTO queue_messages (source, body, sent_at, job_id, targets, lane, owner, spec, expires_at) "
+        "VALUES (%s, %s, to_timestamp(%s), %s, %s, %s, %s, %s, "
+        "to_timestamp(%s) + make_interval(secs => %s::double precision));",
+        (source, body, sent_at, job_id, json.dumps(targets) if targets else None, lane, owner,
+         json.dumps(spec) if spec else None, sent_at, max_age or MAX_AGE_SECONDS),
     )
+    notify(cur)
 
 
 def queue_depth():
+    """Voice messages and clips waiting for an edge."""
     with db.pool().connection() as conn, conn.cursor() as cur:
-        cur.execute(f"SELECT count(*) AS n FROM queue_messages WHERE {LEASABLE};", _params())
+        cur.execute(
+            f"SELECT count(*) AS n FROM queue_messages WHERE {LEASABLE} AND lane = %(lane)s;",
+            _params(lane=INTERACTIVE),
+        )
         return int(cur.fetchone()["n"])
+
+
+def pool_capacity(cur, pool):
+    """A pool's capacity, or None if it is not configured (CREDIT_POOLS)."""
+    cur.execute("SELECT capacity FROM credit_pools WHERE name = %s;", (pool,))
+    row = cur.fetchone()
+    return row["capacity"] if row else None
+
+
+def pool_in_use(cur, pool):
+    cur.execute(f"SELECT count(*) AS n FROM queue_messages WHERE pool = %s AND {LIVE};", (pool,))
+    return int(cur.fetchone()["n"])
+
+
+def lock_pool(cur, pool):
+    """Serialise grants from one pool, so its capacity is never exceeded."""
+    cur.execute("SELECT pg_advisory_xact_lock(hashtext(%s));", (f"pool:{pool}",))
 
 
 # --- sweeper
@@ -195,12 +335,18 @@ def sweep():
     whose final lease lapsed without an ack, and replies still unsent past the max age.
     Runs on a timer, so nothing outlives the max age even while no edge is polling."""
     with db.pool().connection() as conn, conn.cursor() as cur:
+        # One sweeper at a time, however many hub workers run one.
+        cur.execute("SELECT pg_try_advisory_xact_lock(hashtext('queue-sweep')) AS ok;")
+        if not cur.fetchone()["ok"]:
+            return
+        # A job past its age is dropped only once nobody holds it: an edge or app server
+        # still working on one must be able to hand back its result.
         cur.execute(
-            """
+            f"""
             DELETE FROM queue_messages
-            WHERE sent_at < now() - make_interval(secs => %(age)s::double precision)
+            WHERE ({EXPIRES} < now() AND NOT ({LIVE}))
                OR (receive_count >= %(max)s AND visible_at <= now())
-            RETURNING id, source, receive_count, job_id,
+            RETURNING id, source, lane, receive_count, job_id, {EXPIRES} < now() AS expired,
                       extract(epoch FROM now() - sent_at)::int AS age_seconds;
             """,
             _params(),
@@ -208,6 +354,9 @@ def sweep():
         dropped = cur.fetchall()
         ivrit_app.expire(cur, [r["job_id"] for r in dropped if r["source"] == "app"])
         ivrit_app.sweep(cur)
+        credits.dropped(cur, [r for r in dropped if r["lane"] != INTERACTIVE])
+        credits.sweep(cur)
+        limits.sweep(cur)
         expired_replies = outbox.sweep_expired(cur, MAX_AGE_SECONDS)
         offers.retire_expired(cur, time.time())
         identity.sweep_tokens(cur)
@@ -222,8 +371,8 @@ def sweep():
         log.warning("dropping %s unsent repl(ies) past the %ss max age", expired_replies, MAX_AGE_SECONDS)
     if not dropped:
         return
-    stale = [r for r in dropped if r["age_seconds"] >= MAX_AGE_SECONDS]
-    poison = [r for r in dropped if r["age_seconds"] < MAX_AGE_SECONDS]
+    stale = [r for r in dropped if r["expired"]]
+    poison = [r for r in dropped if not r["expired"]]
     # One line per poison message: it should be rare, the body is gone, and the log is the
     # only forensic record left. An age sweep can cover thousands of rows at once, so it
     # gets a summary instead.
@@ -234,8 +383,8 @@ def sweep():
         )
     if stale:
         log.warning(
-            "dropping %s message(s) past the %ss max age (oldest %ss)",
-            len(stale), MAX_AGE_SECONDS, max(r["age_seconds"] for r in stale),
+            "dropping %s message(s) past their max age (oldest %ss)",
+            len(stale), max(r["age_seconds"] for r in stale),
         )
 
 
@@ -272,11 +421,31 @@ async def _json_body(request):
     return body if isinstance(body, dict) else {}
 
 
-def _try_lease(n, min_depth, edge):
+def _try_lease(n, min_depth, edge, pool=None, min_wait=0):
+    """Lease up to n voice messages. An overflow edge leases only what sits above
+    min_depth, or what has waited longer than min_wait seconds; one leasing for a pool
+    (its RunPod endpoint) gets no more than the pool has free."""
     with db.pool().connection() as conn, conn.cursor() as cur:
-        if min_depth:
-            cur.execute(f"SELECT count(*) AS n FROM queue_messages WHERE {LEASABLE};", _params())
-            n = min(n, int(cur.fetchone()["n"]) - min_depth)
+        capacity = None
+        if pool:
+            lock_pool(cur, pool)
+            # An unconfigured pool limits nothing: the edge leases as it always has.
+            capacity = pool_capacity(cur, pool)
+        if capacity is not None:
+            n = min(n, capacity - pool_in_use(cur, pool))
+            if n <= 0:
+                return []
+        if min_depth or min_wait:
+            cur.execute(
+                f"SELECT count(*) AS n, "
+                f"count(*) FILTER (WHERE created_at < now() - make_interval(secs => %(wait)s::double precision)) "
+                f"AS waited FROM queue_messages WHERE {LEASABLE} AND lane = %(lane)s;",
+                _params(lane=INTERACTIVE, wait=min_wait),
+            )
+            row = cur.fetchone()
+            above = int(row["n"]) - min_depth if min_depth else 0
+            waited = int(row["waited"]) if min_wait else 0
+            n = min(n, max(above, waited))
             if n <= 0:
                 return []
         # MATERIALIZED is load-bearing: as a plain IN (SELECT ... LIMIT n) the planner is
@@ -286,7 +455,7 @@ def _try_lease(n, min_depth, edge):
             f"""
             WITH picked AS MATERIALIZED (
               SELECT id FROM queue_messages
-              WHERE {LEASABLE}
+              WHERE {LEASABLE} AND lane = %(lane)s
               ORDER BY id
               FOR UPDATE SKIP LOCKED
               LIMIT %(n)s
@@ -295,13 +464,14 @@ def _try_lease(n, min_depth, edge):
               visible_at     = now() + make_interval(secs => %(vis)s::double precision),
               receive_count  = receive_count + 1,
               receipt_handle = gen_random_uuid()::text,
-              leased_by      = %(edge)s
+              leased_by      = %(edge)s,
+              pool           = %(pool)s
             FROM picked p
             WHERE q.id = p.id
             RETURNING q.id, q.source, q.body, q.receipt_handle, q.receive_count, q.job_id,
                       extract(epoch FROM q.sent_at)::float8 AS sent_at;
             """,
-            _params(n=n, vis=VISIBILITY_TIMEOUT, edge=edge),
+            _params(n=n, vis=VISIBILITY_TIMEOUT, edge=edge, lane=INTERACTIVE, pool=pool),
         )
         rows = cur.fetchall()
         conn.commit()
@@ -341,20 +511,16 @@ async def lease(request: Request, edge: str = Depends(require_edge)):
     n = max(1, min(int(payload.get("max", 1)), MAX_BATCH))
     wait = max(0, min(int(payload.get("wait", 0)), MAX_WAIT_SECONDS))
     min_depth = max(0, int(payload.get("min_depth", 0)))
+    min_wait = max(0, int(payload.get("min_wait", 0)))
+    pool = payload.get("pool") or None
+    if pool is not None and not isinstance(pool, str):
+        raise HTTPException(status_code=400, detail="bad pool")
 
     # Long poll without holding a thread: each attempt runs on the threadpool, and the
     # wait between attempts is an await, so idle edges cost nothing.
-    deadline = time.monotonic() + wait
-    backoff = 0.2
-    rows = []
-    while not _shutting_down.is_set():
-        rows = await run_in_threadpool(_try_lease, n, min_depth, edge)
-        if rows or time.monotonic() >= deadline:
-            break
-        await asyncio.sleep(min(backoff, max(0.0, deadline - time.monotonic())))
-        backoff = min(backoff * 2.5, 1.0)
+    rows = await long_poll(lambda: _try_lease(n, min_depth, edge, pool, min_wait), wait) or []
 
-    log.debug("lease edge=%s max=%s wait=%s min_depth=%s -> %s", edge, n, wait, min_depth, len(rows))
+    log.debug("lease edge=%s max=%s wait=%s min_depth=%s pool=%s -> %s", edge, n, wait, min_depth, pool, len(rows))
     client_ip = request.client.host if request.client else None
     uptime = float(payload.get("uptime_seconds") or 0)
     jobs = await run_in_threadpool(_jobs_for, rows, edge, uptime, client_ip)
@@ -370,7 +536,7 @@ def _leased(cur, handle, lock=False):
         (handle,),
     )
     row = cur.fetchone()
-    if row is None:
+    if row is None or row["source"] not in SOURCES:
         return None, None, None
     adapter = SOURCES[row["source"]]
     parsed = adapter.parse(row["body"])
@@ -443,13 +609,17 @@ def _admit(handle, duration, edge):
             return None
         user = parsed["user_key"]
         app = row["source"] == "app"
+        if row["admission"] is not None:
+            # A retried admit (the edge never saw the answer): already admitted and
+            # charged, so say so again without charging twice.
+            return True
         notice = refusal = None
         if duration is None:
             notice, refusal = messages.DURATION_FAILED, ("duration_failed", None)
         elif duration > limits.MAX_AUDIO_SECONDS:
             notice, refusal = messages.TOO_LONG, ("too_long", None)
         else:
-            allowed, has_resources_left, bucket = limits.admit(user, duration)
+            allowed, has_resources_left, bucket = limits.admit(cur, user, duration)
             if not allowed:
                 wait = bucket.minutes_until_allowed(duration)
                 notice, refusal = messages.rate_limited(wait), ("rate_limited", wait)
@@ -552,6 +722,7 @@ def _complete(handle, text, error, transcription_seconds, duration, edge):
                 "job_id": row["job_id"],
             }))
         cur.execute("DELETE FROM queue_messages WHERE id = %s;", (row["id"],))
+        notify(cur)
         conn.commit()
         stats.cache_messages(cur, edge, minutes)
     for event, props in after:
@@ -587,11 +758,12 @@ RELEASE_DELAY_SECONDS = 10
 def _release(handle):
     with db.pool().connection() as conn, conn.cursor() as cur:
         cur.execute(
-            "UPDATE queue_messages SET visible_at = now() + make_interval(secs => %s::double precision) "
-            "WHERE receipt_handle = %s;",
+            "UPDATE queue_messages SET visible_at = now() + make_interval(secs => %s::double precision), "
+            "pool = NULL WHERE receipt_handle = %s;",
             (RELEASE_DELAY_SECONDS, handle),
         )
         released = cur.rowcount
+        notify(cur)
         conn.commit()
     return released
 

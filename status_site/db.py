@@ -22,7 +22,9 @@ def pool():
                 _pool = ConnectionPool(
                     DATABASE_URL,
                     min_size=1,
-                    max_size=8,
+                    # Long-polls hold no connection while they wait, but the edges,
+                    # the app's server and the senders all query at once.
+                    max_size=int(os.environ.get("DB_POOL_MAX", "20")),
                     kwargs={"row_factory": dict_row},
                     open=True,
                 )

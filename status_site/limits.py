@@ -1,9 +1,8 @@
 """Who may use the service, and how much: region gate, audio length cap and per-user
-rate limits. Held here, in the one hub process, so the limits apply fleet-wide; when
-each edge kept its own buckets, a user's effective limit grew with the fleet."""
+rate limits. Held by the hub, so the limits apply fleet-wide; when each edge kept its
+own buckets, a user's effective limit grew with the fleet."""
 
 import os
-import threading
 import time
 
 import phonenumbers
@@ -12,7 +11,6 @@ from phonenumbers import region_code_for_number
 MAX_AUDIO_SECONDS = 600
 USER_MAX_MESSAGES_PER_HOUR = float(os.environ.get("USER_MAX_MESSAGES_PER_HOUR", "10"))
 USER_MAX_MINUTES_PER_HOUR = float(os.environ.get("USER_MAX_MINUTES_PER_HOUR", "20"))
-BUCKET_CLEANUP_EVERY = 50  # admissions between sweeps of full (idle) buckets
 
 ALLOWED_REGIONS = {
     # North America
@@ -35,78 +33,187 @@ def is_allowed_region(phone_number):
         return False
 
 
-class LeakyBucket:
-    def __init__(self, max_messages_per_hour, max_minutes_per_hour):
-        self.max_messages = max_messages_per_hour
-        self.max_minutes = max_minutes_per_hour * 60  # Convert to seconds
-        self.messages_remaining = max_messages_per_hour
-        self.seconds_remaining = max_minutes_per_hour * 60
-        self.last_update = time.time()
+# --- buckets, in Postgres
+#
+# A bucket fills at `rate` per second up to `cap`, and a transcription takes from it.
+# Kept in Postgres so the limits survive a hub restart and hold across hub workers; a
+# row is locked (FOR UPDATE) while it is checked and charged, so two edges admitting
+# the same user's files at once cannot both slip under the limit, and the charge
+# commits with whatever the caller decided - a retried admit finds that decision and is
+# not charged again (see queue_api._admit).
+#
+# Kinds: "msgs_hour" and "secs_hour" for voice messages (Eliezer's hourly limits),
+# "secs_week" for files transcribed in the app (transcribe.ivrit.ai's weekly quota).
 
-        # Calculate fill rates (per second)
-        self.message_fill_rate = max_messages_per_hour / 3600
-        self.time_fill_rate = self.max_minutes / 3600
+HOURLY = {
+    "msgs_hour": (USER_MAX_MESSAGES_PER_HOUR, USER_MAX_MESSAGES_PER_HOUR / 3600),
+    "secs_hour": (USER_MAX_MINUTES_PER_HOUR * 60, USER_MAX_MINUTES_PER_HOUR * 60 / 3600),
+}
+FILE_MINUTES_PER_WEEK = float(os.environ.get("FILE_QUOTA_MINUTES_PER_WEEK", "420"))
+FILE_REPLENISH_MINUTES_PER_DAY = float(os.environ.get("FILE_QUOTA_REPLENISH_MINUTES_PER_DAY", "60"))
+WEEKLY = (FILE_MINUTES_PER_WEEK * 60, FILE_REPLENISH_MINUTES_PER_DAY * 60 / 86400)
 
-    def update(self):
-        """Update bucket based on elapsed time."""
+
+def init_db(cur):
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS quota_buckets (
+          user_key   TEXT NOT NULL,
+          kind       TEXT NOT NULL,
+          level      DOUBLE PRECISION NOT NULL,
+          cap        DOUBLE PRECISION NOT NULL,
+          rate       DOUBLE PRECISION NOT NULL,
+          custom_cap BOOLEAN NOT NULL DEFAULT false,
+          updated_at DOUBLE PRECISION NOT NULL,
+          PRIMARY KEY (user_key, kind)
+        );
+        """
+    )
+    # What each job was charged, so a charge and its refund each happen once however
+    # often the calls behind them are retried.
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS quota_ledger (
+          job_id   TEXT NOT NULL,
+          kind     TEXT NOT NULL,
+          user_key TEXT NOT NULL,
+          amount   DOUBLE PRECISION NOT NULL,
+          refunded BOOLEAN NOT NULL DEFAULT false,
+          at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+          PRIMARY KEY (job_id, kind)
+        );
+        """
+    )
+
+
+class Bucket:
+    def __init__(self, user_key, kind, level, cap, rate, updated_at):
+        self.user_key, self.kind, self.cap, self.rate = user_key, kind, cap, rate
         now = time.time()
-        elapsed = now - self.last_update
-        self.last_update = now
+        self.level = min(cap, level + rate * max(0.0, now - updated_at))
+        self.updated_at = now
 
-        # Add resources based on fill rate
-        self.messages_remaining = min(self.max_messages, self.messages_remaining + self.message_fill_rate * elapsed)
-        self.seconds_remaining = min(self.max_minutes, self.seconds_remaining + self.time_fill_rate * elapsed)
+    def wait_seconds(self, amount):
+        """Until `amount` is available: 0 now, inf if it never fits."""
+        if amount > self.cap:
+            return float("inf")
+        if self.level >= amount:
+            return 0.0
+        return (amount - self.level) / self.rate if self.rate > 0 else float("inf")
 
-    def can_transcribe(self, duration_seconds):
-        """Check if transcription is allowed."""
-        self.update()
-        return self.messages_remaining >= 1 and self.seconds_remaining >= duration_seconds
 
-    def consume(self, duration_seconds):
-        """Consume resources for transcription."""
-        self.update()
-        self.messages_remaining -= 1
-        self.seconds_remaining -= duration_seconds
-        return self.messages_remaining > 0 and self.seconds_remaining > 0
+def _lock(cur, user_key, kind, cap, rate):
+    cur.execute(
+        "INSERT INTO quota_buckets (user_key, kind, level, cap, rate, updated_at) "
+        "VALUES (%s, %s, %s, %s, %s, %s) ON CONFLICT DO NOTHING;",
+        (user_key, kind, cap, cap, rate, time.time()),
+    )
+    cur.execute(
+        "SELECT level, cap, rate, custom_cap, updated_at FROM quota_buckets "
+        "WHERE user_key = %s AND kind = %s FOR UPDATE;",
+        (user_key, kind),
+    )
+    row = cur.fetchone()
+    # The configured rate applies to everyone; a cap set for one user stays theirs.
+    return Bucket(user_key, kind, row["level"], row["cap"] if row["custom_cap"] else cap, rate, row["updated_at"])
 
-    def is_full(self):
-        """Check if the bucket is full (or nearly full)."""
-        self.update()
-        return (self.messages_remaining >= self.max_messages * 0.95 and
-                self.seconds_remaining >= self.max_minutes * 0.95)
+
+def _peek(cur, user_key, kind, cap, rate):
+    cur.execute(
+        "SELECT level, cap, custom_cap, updated_at FROM quota_buckets WHERE user_key = %s AND kind = %s;",
+        (user_key, kind),
+    )
+    row = cur.fetchone()
+    if row is None:
+        return Bucket(user_key, kind, cap, cap, rate, time.time())
+    return Bucket(user_key, kind, row["level"], row["cap"] if row["custom_cap"] else cap, rate, row["updated_at"])
+
+
+def _save(cur, bucket):
+    cur.execute(
+        "UPDATE quota_buckets SET level = %s, cap = %s, rate = %s, updated_at = %s "
+        "WHERE user_key = %s AND kind = %s;",
+        (bucket.level, bucket.cap, bucket.rate, bucket.updated_at, bucket.user_key, bucket.kind),
+    )
+
+
+class Refusal:
+    """Why a voice message was refused, for the user's notice and for analytics."""
+
+    def __init__(self, messages, seconds):
+        self.messages_remaining = messages.level
+        self.seconds_remaining = seconds.level
+        self._messages, self._seconds = messages, seconds
 
     def minutes_until_allowed(self, duration_seconds):
-        """Rough wait before a transcription of this length would be allowed."""
-        if self.messages_remaining < 1:
-            remaining_time = 1 / USER_MAX_MESSAGES_PER_HOUR
+        if self._messages.level < 1:
+            wait = self._messages.wait_seconds(1)
         else:
-            # Must be time limit that's causing the issue
-            remaining_time = (duration_seconds - self.seconds_remaining) / (USER_MAX_MINUTES_PER_HOUR * 60)
-        return max(1, int(remaining_time * 60))
+            wait = self._seconds.wait_seconds(duration_seconds)
+        return max(1, int(min(wait, 10 ** 6) / 60))
 
 
-_buckets = {}
-_buckets_lock = threading.Lock()
-_admissions = 0
+def admit(cur, user, duration_seconds):
+    """Charge a voice message of this length to the user's hourly buckets, inside the
+    caller's transaction. Returns (allowed, has_resources_left, refusal)."""
+    messages = _lock(cur, user, "msgs_hour", *HOURLY["msgs_hour"])
+    seconds = _lock(cur, user, "secs_hour", *HOURLY["secs_hour"])
+    if messages.level < 1 or seconds.level < duration_seconds:
+        return False, None, Refusal(messages, seconds)
+    messages.level -= 1
+    seconds.level -= duration_seconds
+    _save(cur, messages)
+    _save(cur, seconds)
+    return True, messages.level > 0 and seconds.level > 0, None
 
 
-def admit(user, duration_seconds):
-    """Charge a transcription of this length to the user's bucket.
+# --- the weekly quota for files
 
-    Returns (allowed, has_resources_left, bucket). Check and charge happen under one lock,
-    so two edges admitting the same user's files at once cannot both slip under the limit.
-    """
-    global _admissions
-    with _buckets_lock:
-        bucket = _buckets.get(user)
-        if bucket is None:
-            bucket = _buckets[user] = LeakyBucket(USER_MAX_MESSAGES_PER_HOUR, USER_MAX_MINUTES_PER_HOUR)
-        if not bucket.can_transcribe(duration_seconds):
-            return False, None, bucket
-        has_resources_left = bucket.consume(duration_seconds)
-        _admissions += 1
-        if _admissions % BUCKET_CLEANUP_EVERY == 0:
-            # A full bucket is indistinguishable from a new one; drop them to bound memory.
-            for key in [k for k, b in _buckets.items() if b.is_full()]:
-                del _buckets[key]
-        return True, has_resources_left, bucket
+def file_quota(cur, user):
+    """The user's weekly bucket as it stands (read only)."""
+    return _peek(cur, user, "secs_week", *WEEKLY)
+
+
+def charge_file(cur, job_id, user, seconds):
+    """Charge a file job once. Returns (ok, bucket): not ok, nothing charged, when the
+    bucket lacks the time. A repeat of a charge already made is ok and charges nothing."""
+    bucket = _lock(cur, user, "secs_week", *WEEKLY)
+    cur.execute("SELECT 1 FROM quota_ledger WHERE job_id = %s AND kind = 'secs_week';", (job_id,))
+    if cur.fetchone():
+        return True, bucket
+    if bucket.level < seconds:
+        return False, bucket
+    bucket.level -= seconds
+    _save(cur, bucket)
+    cur.execute(
+        "INSERT INTO quota_ledger (job_id, kind, user_key, amount) VALUES (%s, 'secs_week', %s, %s);",
+        (job_id, user, seconds),
+    )
+    return True, bucket
+
+
+def refund_file(cur, job_id):
+    """Give back what a job was charged, once: it produced nothing."""
+    cur.execute(
+        "UPDATE quota_ledger SET refunded = true WHERE job_id = %s AND kind = 'secs_week' "
+        "AND NOT refunded RETURNING user_key, amount;",
+        (job_id,),
+    )
+    row = cur.fetchone()
+    if row is None:
+        return 0.0
+    bucket = _lock(cur, row["user_key"], "secs_week", *WEEKLY)
+    # Capped, so a refund after the bucket refilled cannot lift anyone above their cap.
+    bucket.level = min(bucket.cap, bucket.level + row["amount"])
+    _save(cur, bucket)
+    return row["amount"]
+
+
+def sweep(cur):
+    """Forget buckets that have refilled - indistinguishable from new ones - and ledger
+    entries too old to be refunded."""
+    cur.execute(
+        "DELETE FROM quota_buckets WHERE NOT custom_cap "
+        "AND level + rate * (extract(epoch FROM now()) - updated_at) >= cap;"
+    )
+    cur.execute("DELETE FROM quota_ledger WHERE at < now() - interval '30 days';")
