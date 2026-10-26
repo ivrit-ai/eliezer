@@ -14,11 +14,13 @@ import time
 import uvicorn
 from fastapi import FastAPI
 from fastapi.responses import FileResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
 
 from faq import FAQ
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
+app.mount("/static", StaticFiles(directory=os.path.join(BASE_DIR, "static")), name="static")
 
 
 def _series(n, step, base):
