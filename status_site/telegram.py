@@ -34,7 +34,10 @@ MAX_TEXT_LENGTH = 4000
 MAX_FILE_MB = float(os.environ.get("TELEGRAM_MAX_FILE_MB", "20"))
 MAX_FILE_BYTES = int(MAX_FILE_MB * 1024 * 1024)
 REQUEST_TIMEOUT = (10, 30)
-UPLOAD_TIMEOUT = (10, 120)
+# Within the outbox's claims (CLAIM_SECONDS, VIDEO_CLAIM_SECONDS), so a slow upload is
+# not sent twice.
+UPLOAD_TIMEOUT = (10, 100)
+VIDEO_UPLOAD_TIMEOUT = (10, 300)
 MEDIA_TIMEOUT = httpx.Timeout(120.0, connect=10.0)
 
 COMMANDS = [
@@ -149,12 +152,12 @@ def target(parsed):
 
 # --- sending
 
-def _call(method, payload, files=None):
+def _call(method, payload, files=None, timeout=None):
     """A Bot API call: JSON, or multipart form fields plus files when there are files."""
     try:
         if files:
             response = requests.post(f"{API_URL}/bot{BOT_TOKEN}/{method}", data=payload, files=files,
-                                     timeout=UPLOAD_TIMEOUT)
+                                     timeout=timeout or UPLOAD_TIMEOUT)
         else:
             response = requests.post(f"{API_URL}/bot{BOT_TOKEN}/{method}", json=payload, timeout=REQUEST_TIMEOUT)
     except requests.RequestException as e:
@@ -195,6 +198,20 @@ def send_document(address, filename, data, caption=None, quote=None):
         # Multipart fields are strings: objects go as JSON.
         payload["reply_parameters"] = json.dumps({"message_id": quote, "allow_sending_without_reply": True})
     return _call("sendDocument", payload, files={"document": (filename, data, "application/x-subrip")})
+
+
+def send_video(address, filename, data, width=None, height=None, duration=None, caption=None, quote=None):
+    """Send a video (one with its subtitles burned in), streamable, quoting the message
+    it answers."""
+    payload = {"chat_id": address, "supports_streaming": "true"}
+    for key, value in (("width", width), ("height", height), ("duration", duration)):
+        if value:
+            payload[key] = str(int(value))
+    if caption:
+        payload["caption"] = caption
+    if quote:
+        payload["reply_parameters"] = json.dumps({"message_id": quote, "allow_sending_without_reply": True})
+    return _call("sendVideo", payload, files={"video": (filename, data, "video/mp4")}, timeout=VIDEO_UPLOAD_TIMEOUT)
 
 
 def edit_text(address, message_id, text):

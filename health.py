@@ -1,4 +1,4 @@
-"""The health endpoint xhost checks on worker processes (edges)."""
+"""The health endpoint xhost checks on worker processes (edges, render workers)."""
 
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer

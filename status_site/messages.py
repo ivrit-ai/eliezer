@@ -24,6 +24,8 @@ def too_large(max_mb):
 
 # The caption of a video's subtitles file, sent after its transcript.
 SUBTITLES_CAPTION = "כתוביות לסרטון (SRT). אפשר לפתוח אותן בנגן וידאו, למשל VLC, יחד עם הסרטון."
+# The caption of the video sent back with its subtitles burned in.
+RENDERED_CAPTION = "הסרטון עם כתוביות"
 
 # Sent after every transcript delivered on WhatsApp, as its own message so the transcript
 # stays clean to copy.
