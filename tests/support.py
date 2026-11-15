@@ -13,6 +13,10 @@ AUDIO = {
     # just over the 10-minute cap
     "long.ogg": ["-f", "lavfi", "-i", "sine=frequency=220:duration=601", "-c:a", "libopus", "-b:a", "6k"],
     "song.mp3": ["-f", "lavfi", "-i", "sine=frequency=550:duration=2", "-c:a", "libmp3lame", "-b:a", "32k"],
+    # a video with sound, for subtitles
+    "clip.mp4": ["-f", "lavfi", "-i", "testsrc=size=320x240:rate=10:duration=3",
+                 "-f", "lavfi", "-i", "sine=frequency=440:duration=3",
+                 "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest"],
 }
 
 

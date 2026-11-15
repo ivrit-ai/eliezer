@@ -171,7 +171,7 @@ def _route(source, items):
                 size = (parsed["media"] or {}).get("size")
                 if source == "telegram" and size and size > telegram.MAX_FILE_BYTES:
                     for target in targets:
-                        outbox.enqueue_text(cur, target, messages.TOO_LARGE, sent_at)
+                        outbox.enqueue_text(cur, target, messages.too_large(telegram.MAX_FILE_MB), sent_at)
                     counts["answered"] += 1
                     continue
                 # Counted when an edge first leases it, like the edges always did.

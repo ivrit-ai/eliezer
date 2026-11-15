@@ -1,6 +1,7 @@
 # Eliezer
 
-Transcribes WhatsApp voice notes. Two parts:
+Transcribes WhatsApp voice notes, and Telegram voice notes and videos (a video also gets
+its subtitles back, as an `.srt` after the transcript). Two parts:
 
 - **The status site** (`status_site/`, deployed on xhostd) is the hub.
   It receives the WhatsApp webhook, queues voice notes, answers everything that isn't a

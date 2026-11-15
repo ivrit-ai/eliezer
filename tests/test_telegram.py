@@ -15,6 +15,8 @@ import types
 import urllib.error
 import urllib.parse
 import urllib.request
+from email.parser import BytesParser
+from email.policy import default as email_policy
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import psycopg
@@ -50,10 +52,13 @@ def free_port():
 
 LOCK = threading.Lock()
 MEDIA = {}                 # id -> (path, mime)   (WhatsApp media ids and Telegram file ids)
-WA_SENT, TG_SENT, TG_CALLS = [], [], []
+WA_SENT, TG_SENT, TG_CALLS, TG_DOCS = [], [], [], []
 _message_ids = iter(range(5000, 10 ** 9))
 TG_FORBIDDEN = set()       # chat ids answering 403
 FILE_FAIL = {}             # file_id -> status codes its downloads return first, in order
+DOC_FAIL = {}              # chat id -> status codes its sendDocument calls return first
+SLOW_TEXT = {}             # chat id -> seconds its sendMessage calls take
+DELIVERED = []             # (chat id, method) in the order sends completed
 
 
 class Base(BaseHTTPRequestHandler):
@@ -111,9 +116,35 @@ class Telegram(Base):
         if parts[0] != f"bot{TG_TOKEN}":
             return self._json(401, {"ok": False, "description": "Unauthorized"})
         method = parts[1]
-        data = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0) or b"{}") or b"{}")
+        raw = self.rfile.read(int(self.headers.get("Content-Length") or 0))
+        ctype = self.headers.get("Content-Type", "")
+        if ctype.startswith("multipart/form-data"):
+            # Files (sendDocument): form fields are strings, objects arrive as JSON.
+            form = BytesParser(policy=email_policy).parsebytes(
+                b"Content-Type: " + ctype.encode() + b"\r\n\r\n" + raw)
+            data = {}
+            for part in form.iter_parts():
+                name = part.get_param("name", header="content-disposition")
+                body = part.get_payload(decode=True)
+                data[name] = {"filename": part.get_filename(), "bytes": body} if part.get_filename() else body.decode()
+        else:
+            data = json.loads(raw or b"{}")
+        slow = SLOW_TEXT.get(str(data.get("chat_id"))) if method == "sendMessage" else None
+        if slow:
+            time.sleep(slow)
         with LOCK:
             TG_CALLS.append((method, data))
+            if method in ("sendMessage", "sendDocument", "sendVideo"):
+                DELIVERED.append((str(data.get("chat_id")), method))
+            if method == "sendDocument":
+                pending = DOC_FAIL.get(str(data["chat_id"]))
+                code = pending.pop(0) if pending else None
+                if code == 429:
+                    return self._json(429, {"ok": False, "error_code": 429, "description": "Too Many Requests",
+                                            "parameters": {"retry_after": 1}})
+                if code:
+                    return self._json(code, {"ok": False, "error_code": code, "description": "error"})
+                TG_DOCS.append(data)
             if method == "sendMessage":
                 if str(data["chat_id"]) in TG_FORBIDDEN:
                     return self._json(403, {"ok": False, "error_code": 403,
@@ -161,6 +192,11 @@ def wa_reactions(mid=None):
                 and (mid is None or m.get("reaction", {}).get("message_id") == mid)]
 
 
+def tg_docs(chat):
+    with LOCK:
+        return [d for d in TG_DOCS if str(d["chat_id"]) == str(chat)]
+
+
 def tg_calls(method, chat=None):
     with LOCK:
         return [d for m, d in TG_CALLS if m == method and (chat is None or str(d.get("chat_id")) == str(chat))]
@@ -200,7 +236,7 @@ def wa(frm, mtype="audio", text=None, media="m-short"):
 
 
 def tg(chat, text=None, voice=None, document=None, chat_type="private", update_id=None, secret=TG_SECRET,
-       sender=None, reply_to=None):
+       sender=None, reply_to=None, video=None, video_note=None):
     uid = update_id or next(_ids)
     msg = {"message_id": next(_ids), "date": int(time.time()), "chat": {"id": int(chat), "type": chat_type},
            "from": {"id": int(sender or chat), "first_name": "T"}}
@@ -212,6 +248,12 @@ def tg(chat, text=None, voice=None, document=None, chat_type="private", update_i
         msg["voice"] = {"file_id": voice, "mime_type": "audio/ogg", "file_size": 11906, "duration": 3}
     if document:
         msg["document"] = document
+    if video:
+        msg["video"] = {"file_id": video, "mime_type": "video/mp4", "file_size": 40000, "duration": 3,
+                        "width": 320, "height": 240}
+    if video_note:
+        # Round video messages carry no mime type.
+        msg["video_note"] = {"file_id": video_note, "file_size": 40000, "duration": 3, "length": 240}
     st, _ = http("POST", "/webhook/telegram", {"update_id": uid, "message": msg},
                  headers={"X-Telegram-Bot-Api-Secret-Token": secret})
     return st, msg["message_id"], uid
@@ -244,7 +286,9 @@ def token_from(messages):
 # ---------------------------------------------------------------- main
 def main():
     MEDIA.update({"m-short": (os.path.join(FIX, "short.ogg"), "audio/ogg"),
-                  "f-short": (os.path.join(FIX, "short.ogg"), "audio/ogg")})
+                  "f-short": (os.path.join(FIX, "short.ogg"), "audio/ogg"),
+                  "f-clip": (os.path.join(FIX, "clip.mp4"), "video/mp4"),
+                  "f-song": (os.path.join(FIX, "song.mp3"), "audio/mpeg")})
     graph = ThreadingHTTPServer(("127.0.0.1", 0), Graph)
     tgapi = ThreadingHTTPServer(("127.0.0.1", 0), Telegram)
     for s in (graph, tgapi):
@@ -335,6 +379,48 @@ def main():
         tg("222", document={"file_id": "f-big", "file_size": 30 * 1024 * 1024, "mime_type": "audio/mpeg"})
         wait_for(lambda: len(tg_to("222")) >= 2)
         check("files over 20MB are refused up front", "20MB" in tg_to("222")[-1]["text"])
+
+        # ===== videos: the transcript, then its subtitles as an .srt
+        _, vid, _ = tg("350", video="f-clip")
+        wait_for(lambda: tg_docs("350"), 30)
+        texts = tg_to("350")
+        check("a video sent in Telegram is transcribed as a quoted reply",
+              any(m["text"] == "hello world" and m.get("reply_parameters", {}).get("message_id") == vid
+                  for m in texts), texts)
+        docs = tg_docs("350")
+        doc = docs[0] if docs else {}
+        body = (doc.get("document") or {}).get("bytes", b"").decode("utf-8", "replace")
+        check("...followed by its subtitles as transcript.srt",
+              len(docs) == 1 and doc["document"]["filename"] == "transcript.srt", docs)
+        check("...an SRT with the transcript's timings, its lines marked right-to-left",
+              body.startswith("1\n00:00:00,000 --> 00:00:01,500\n\u200fhello world\u200f"), repr(body[:80]))
+        check("...quoting the video, with a caption",
+              json.loads(doc.get("reply_parameters", "{}")).get("message_id") == vid and doc.get("caption"), doc)
+        _, vn, _ = tg("350", video_note="f-clip")
+        wait_for(lambda: len(tg_docs("350")) >= 2, 30)
+        check("a round video message gets subtitles too",
+              len(tg_docs("350")) == 2 and json.loads(tg_docs("350")[1]["reply_parameters"])["message_id"] == vn)
+        _, vmid, _ = tg("350", voice="f-short")
+        tg("350", document={"file_id": "f-song", "file_size": 20000, "mime_type": "audio/mpeg",
+                            "file_name": "song.mp3"})
+        wait_for(lambda: sum(m["text"] == "hello world" for m in tg_to("350")) >= 4, 30)
+        time.sleep(1)
+        check("a voice note or an audio file gets its transcript and no subtitles",
+              sum(m["text"] == "hello world" for m in tg_to("350")) == 4 and len(tg_docs("350")) == 2,
+              (len(tg_to("350")), len(tg_docs("350"))))
+        SLOW_TEXT["354"] = 2
+        tg("354", video="f-clip")
+        wait_for(lambda: tg_docs("354"), 30)
+        order = [m for c, m in DELIVERED if c == "354"]
+        check("subtitles wait for the transcript, however slow its send",
+              order[:2] == ["sendMessage", "sendDocument"], order)
+        DOC_FAIL["351"] = [429]
+        tg("351", video="f-clip")
+        wait_for(lambda: tg_docs("351"), 30)
+        check("subtitles refused with 429 are sent again after retry_after",
+              len(tg_docs("351")) == 1 and len(tg_calls("sendDocument", "351")) == 2, tg_calls("sendDocument", "351"))
+        check("subtitles count as messages sent to Telegram",
+              q("SELECT tg_sent FROM totals")[0][0] >= 3)
 
         check("transcripts delivered to Telegram carry no pricing notice",
               not any(m["text"].startswith(NOTICE) for m in tg_to("111") + tg_to("222")))
@@ -618,7 +704,7 @@ def main():
         wait_for(lambda: q("SELECT count(*) FROM outbox")[0][0] == 0, 10)
         s = json.loads(http("GET", "/api/stats")[1])
         with LOCK:
-            delivered = len(TG_SENT)
+            delivered = len(TG_SENT) + len(TG_DOCS)
         check("tg_sent counts every message delivered to Telegram", s["totals"]["tg_sent"] == delivered,
               (s["totals"]["tg_sent"], delivered))
         s = json.loads(http("GET", "/api/stats")[1])
@@ -667,7 +753,7 @@ def start_edge():
     import whatsapp_bot
 
     async def fake_segments(self, audio_path):
-        return [types.SimpleNamespace(text="hello world")]
+        return [types.SimpleNamespace(text="hello world", start=0.0, end=1.5)]
     whatsapp_bot.WhatsAppBot._collect_transcription_segments = fake_segments
     EDGE = whatsapp_bot.WhatsAppBot(num_workers=2)
     threading.Thread(target=EDGE.run, daemon=True).start()
