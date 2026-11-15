@@ -85,12 +85,18 @@ class QueueClient:
         lease would lapse."""
         self._post("/queue/release", {"handle": handle}, retries=1)
 
-    def complete(self, handle, text=None, error=None, transcription_seconds=None, duration=None):
-        """Hand back the transcript (or the reason there is none); the site replies."""
-        self._post("/queue/complete", {
+    def complete(self, handle, text=None, error=None, transcription_seconds=None, duration=None,
+                 segments=None):
+        """Hand back the transcript (or the reason there is none); the site replies.
+        segments are its timings ([{start, end, text}]), for subtitles; sites that
+        predate them ignore the field."""
+        payload = {
             "handle": handle, "text": text, "error": error,
             "transcription_seconds": transcription_seconds, "duration": duration,
-        })
+        }
+        if segments:
+            payload["segments"] = segments
+        self._post("/queue/complete", payload)
 
 
 def make_queue_client():

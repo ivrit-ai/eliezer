@@ -65,6 +65,18 @@ STALLED_THRESHOLD = 120  # seconds before a thread is flagged as possibly stuck
 IDLE_PROBE_INTERVAL = 10  # seconds the dispatcher waits when there is nothing to pull
 
 
+def timed_segments(segments):
+    """ivrit segments as JSON for the site: [{start, end, text}]. None if any segment
+    lacks timings."""
+    out = []
+    for segment in segments:
+        start, end = getattr(segment, 'start', None), getattr(segment, 'end', None)
+        if start is None or end is None:
+            return None
+        out.append({'start': round(float(start), 3), 'end': round(float(end), 3), 'text': segment.text.strip()})
+    return out or None
+
+
 class WhatsAppBot:
     def __init__(self, num_workers, local=False, overflow_handler=None, debug=False, overflow_min_wait=0):
         self.queue = make_queue_client()
@@ -125,7 +137,8 @@ class WhatsAppBot:
             logging.getLogger('ivrit').setLevel(logging.DEBUG)
 
     def transcribe_audio(self, audio_path):
-        """Transcribe audio using the ivrit package (async path -> aiohttp)."""
+        """Transcribe audio using the ivrit package (async path -> aiohttp). Returns the
+        text and the timed segments (None when there are none), for subtitles."""
         try:
             self.logger.debug(f"transcribe_audio: waiting for transcription slot for {audio_path}")
             with self.transcription_semaphore:
@@ -134,11 +147,11 @@ class WhatsAppBot:
             self.logger.debug(f"transcribe_audio: completed for {audio_path} ({len(segments)} segments)")
             text_result = '\n'.join(segment.text.strip() for segment in segments)
             if text_result:
-                return text_result
-            return "לא הצלחתי להבין את ההודעה הקולית."
+                return text_result, timed_segments(segments)
+            return "לא הצלחתי להבין את ההודעה הקולית.", None
         except Exception as e:
             self.logger.error(f"Error transcribing audio: {e}")
-            return "אירעה שגיאה בעיבוד ההודעה הקולית."
+            return "אירעה שגיאה בעיבוד ההודעה הקולית.", None
 
     async def _collect_transcription_segments(self, audio_path):
         """Consume ivrit's async transcription generator into a list of segments."""
@@ -160,16 +173,17 @@ class WhatsAppBot:
             return None
 
     def process_audio_message(self, audio_path):
-        """Transcribe, turning failure and silence into a message for the user."""
+        """Transcribe, turning failure and silence into a message for the user. Returns
+        (text, segments); segments only for a real transcript."""
         try:
-            transcription = self.transcribe_audio(audio_path)
+            transcription, segments = self.transcribe_audio(audio_path)
             if not transcription or transcription.strip() == "":
                 self.logger.warning("Transcription returned empty text")
-                return "התמלול לא החזיר טקסט. ייתכן שההקלטה שקטה מדי."
-            return transcription
+                return "התמלול לא החזיר טקסט. ייתכן שההקלטה שקטה מדי.", None
+            return transcription, segments
         except Exception as e:
             self.logger.error(f"Transcription failed: {str(e)}")
-            return "אירעה שגיאה בתמלול ההקלטה."
+            return "אירעה שגיאה בתמלול ההקלטה.", None
 
     def convert_to_opus(self, input_path):
         """Convert a document to Opus (CBR, mono) via ffmpeg; None if it isn't audio."""
@@ -221,11 +235,14 @@ class WhatsAppBot:
 
             self._set_activity(f"transcribing job {label}")
             started = time.time()
-            text = self.process_audio_message(audio_path)
+            text, segments = self.process_audio_message(audio_path)
             transcription_seconds = time.time() - started
 
             self._set_activity(f"completing job {label}")
-            self.queue.complete(handle, text=text, transcription_seconds=transcription_seconds, duration=duration)
+            # Timings only for documents (videos among them), where the site may answer
+            # with subtitles; a voice note's reply is its text alone.
+            self.queue.complete(handle, text=text, transcription_seconds=transcription_seconds, duration=duration,
+                                segments=segments if job['kind'] == 'document' else None)
             with self.counter_lock:
                 self.transcription_counter += 1
                 self.total_duration += duration
