@@ -15,7 +15,17 @@ def rate_limited(minutes):
     )
 
 
-TOO_LARGE = "הקובץ גדול מדי. אפשר לשלוח קבצים של עד 20MB."
+def too_large(max_mb):
+    return (
+        f"הקובץ גדול מדי. אפשר לשלוח קבצים של עד {max_mb:g}MB.\n\n"
+        "טיפ לסרטונים: פתחו את טלגרם, לחצו על 📎, בחרו את הסרטון ושלחו אותו - כך טלגרם תכווץ אותו. "
+        "סרטון ששותף מהגלריה, מוואטסאפ או מאפליקציה אחרת נשלח בגודל המקורי, בלי כיווץ."
+    )
+
+# The caption of a video's subtitles file, sent after its transcript.
+SUBTITLES_CAPTION = "כתוביות לסרטון (SRT). אפשר לפתוח אותן בנגן וידאו, למשל VLC, יחד עם הסרטון."
+# The caption of the video sent back with its subtitles burned in.
+RENDERED_CAPTION = "הסרטון עם כתוביות"
 
 # Sent after every transcript delivered on WhatsApp, as its own message so the transcript
 # stays clean to copy.
@@ -56,7 +66,7 @@ https://status.eliezer.ivrit.ai
 
 TG_WELCOME = (
     "שלום! אני אליעזר, בוט התמלול של ivrit.ai.\n"
-    "שלחו לי כאן הקלטה ואתמלל אותה.\n\n"
+    "שלחו לי כאן הקלטה ואתמלל אותה. על סרטון אחזיר גם קובץ כתוביות.\n\n"
     "רוצים לקבל כאן גם את התמלולים של הקלטות שאתם שולחים לי בוואטסאפ? "
     "לחצו על הכפתור, ובוואטסאפ שייפתח שלחו את ההודעה כמו שהיא."
 )

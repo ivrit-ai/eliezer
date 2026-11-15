@@ -7,6 +7,7 @@ is retried, and if the process dies mid-reply the next sender resumes at the nex
 The one exception is an explicit drop: rows past the max age expire like queue messages.
 """
 
+import base64
 import json
 import logging
 import os
@@ -31,6 +32,9 @@ SENDER_THREADS = int(os.environ.get("OUTBOX_SENDERS", "4"))
 # A claimed row is invisible to other senders for this long; a sender that dies mid-send
 # releases it by timing out. Longest send is a multi-part reply, well under this.
 CLAIM_SECONDS = 120
+# A video can take longer to upload: its claim is extended to this before it is sent,
+# beyond the adapter's upload timeout.
+VIDEO_CLAIM_SECONDS = 600
 MAX_BACKOFF_SECONDS = 300
 PART_INTERVAL_SECONDS = 0.1  # between parts of a long reply, as before
 
@@ -57,6 +61,17 @@ def init_outbox_db(cur):
         """
     )
     cur.execute("CREATE INDEX IF NOT EXISTS outbox_due_idx ON outbox (next_attempt_at, id);")
+    cur.execute("CREATE INDEX IF NOT EXISTS outbox_address_idx ON outbox (channel, address, id);")
+    # A video waiting to be sent (see enqueue_video): too big for the row's JSON payload,
+    # and gone with its row, however that row ends.
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS outbox_files (
+          outbox_id BIGINT PRIMARY KEY REFERENCES outbox (id) ON DELETE CASCADE,
+          data      BYTEA NOT NULL
+        );
+        """
+    )
 
 
 def split_text(channel, text, quote):
@@ -109,6 +124,44 @@ def enqueue_text(cur, target, text, sent_at, extra=(), source_handle=None, butto
         """,
         (target["channel"], target["address"], json.dumps(payload), sent_at, source_handle),
     )
+    _wakeup.set()
+
+
+def enqueue_document(cur, target, filename, data, sent_at, caption=None, source_handle=None):
+    """Queue a file (a video's subtitles) to target, quoting what it answers. Only for
+    channels that send files: elsewhere it is dropped, as WhatsApp would bill it."""
+    if not hasattr(CHANNELS[target["channel"]], "send_document"):
+        return
+    payload = {"filename": filename, "data": base64.b64encode(data).decode("ascii"),
+               "caption": caption, "quote": target.get("quote")}
+    cur.execute(
+        """
+        INSERT INTO outbox (channel, address, action, payload, sent_at, source_handle)
+        VALUES (%s, %s, 'document', %s, to_timestamp(%s), %s);
+        """,
+        (target["channel"], target["address"], json.dumps(payload), sent_at, source_handle),
+    )
+    _wakeup.set()
+
+
+def can_send_video(target):
+    return hasattr(CHANNELS[target["channel"]], "send_video")
+
+
+def enqueue_video(cur, target, filename, data, sent_at, meta, caption=None, source_handle=None):
+    """Queue a video (a video with its subtitles burned in) to target, quoting what it
+    answers. meta: width, height, duration. Only for channels that send videos."""
+    if not can_send_video(target):
+        return
+    payload = {"filename": filename, "caption": caption, "quote": target.get("quote"), **(meta or {})}
+    cur.execute(
+        """
+        INSERT INTO outbox (channel, address, action, payload, sent_at, source_handle)
+        VALUES (%s, %s, 'video', %s, to_timestamp(%s), %s) RETURNING id;
+        """,
+        (target["channel"], target["address"], json.dumps(payload), sent_at, source_handle),
+    )
+    cur.execute("INSERT INTO outbox_files (outbox_id, data) VALUES (%s, %s);", (cur.fetchone()["id"], data))
     _wakeup.set()
 
 
@@ -187,9 +240,15 @@ def _claim():
         cur.execute(
             """
             WITH picked AS MATERIALIZED (
-              SELECT id FROM outbox
+              SELECT id FROM outbox b
               WHERE next_attempt_at <= now()
                 AND (claimed_until IS NULL OR claimed_until < now())
+                -- Senders run in parallel, so a file (slower to send) could overtake the
+                -- transcript it follows: it waits until the chat's earlier messages are out.
+                AND (action NOT IN ('document', 'video') OR NOT EXISTS (
+                  SELECT 1 FROM outbox e
+                  WHERE e.channel = b.channel AND e.address = b.address AND e.id < b.id
+                    AND e.action IN ('text', 'document', 'video')))
               ORDER BY id
               FOR UPDATE SKIP LOCKED
               LIMIT 1
@@ -226,6 +285,28 @@ def _deliver(row):
     if row["action"] == "reaction":
         if hasattr(adapter, "send_reaction"):
             adapter.send_reaction(row["address"], row["payload"]["message_id"], row["payload"]["emoji"])
+        return
+    if row["action"] == "document":
+        p = row["payload"]
+        adapter.send_document(row["address"], p["filename"], base64.b64decode(p["data"]),
+                              p.get("caption"), p.get("quote"))
+        counter = SENT_COUNTERS.get(row["channel"])
+        if counter:
+            _execute(f"UPDATE totals SET {counter} = {counter} + 1 WHERE id = 1;", ())
+        return
+    if row["action"] == "video":
+        p = row["payload"]
+        _execute("UPDATE outbox SET claimed_until = now() + make_interval(secs => %s::double precision) "
+                 "WHERE id = %s;", (VIDEO_CLAIM_SECONDS, row["id"]))
+        with db.pool().connection() as conn, conn.cursor() as cur:
+            cur.execute("SELECT data FROM outbox_files WHERE outbox_id = %s;", (row["id"],))
+            file = cur.fetchone()
+        if file is not None:
+            adapter.send_video(row["address"], p["filename"], bytes(file["data"]), p.get("width"),
+                               p.get("height"), p.get("duration"), p.get("caption"), p.get("quote"))
+            counter = SENT_COUNTERS.get(row["channel"])
+            if counter:
+                _execute(f"UPDATE totals SET {counter} = {counter} + 1 WHERE id = 1;", ())
         return
     if row["action"] != "text":
         adapter.send_receipt(row["address"], row["payload"]["message_id"], row["action"] == "typing")
@@ -289,7 +370,7 @@ def _send_one(row):
             _execute("DELETE FROM outbox WHERE channel = %s AND address = %s;",
                      (row["channel"], row["address"]))
             return
-        if row["action"] in ("text", "link", "reaction", "edit") and e.retryable:
+        if row["action"] in ("text", "document", "video", "link", "reaction", "edit") and e.retryable:
             delay = e.retry_after or min(5 * 2 ** (row["attempts"] - 1), MAX_BACKOFF_SECONDS)
             log.debug("outbox %s to %s:%s failed (%s); retry in %ss",
                       row["id"], row["channel"], row["address"], e, delay)
@@ -300,7 +381,7 @@ def _send_one(row):
             )
             return
         # A receipt is only worth sending now; a permanent error will not go away.
-        level = logging.WARNING if row["action"] == "text" else logging.DEBUG
+        level = logging.WARNING if row["action"] in ("text", "document", "video") else logging.DEBUG
         log.log(level, "outbox %s %s to %s:%s dropped: %s",
                 row["id"], row["action"], row["channel"], row["address"], e)
     except Exception:

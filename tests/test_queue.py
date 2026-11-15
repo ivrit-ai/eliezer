@@ -194,8 +194,14 @@ def main():
         st, body = http("POST", "/queue/lease", {"max": 10, "wait": 0}, edge(inst="edge-b"))
         rest = json.loads(body)["jobs"]
         check("leased message is invisible to another edge", m["handle"] not in [r["handle"] for r in rest] and len(rest) == 3)
-        for r in rest + [m]:
-            http("POST", "/queue/complete", {"handle": r["handle"], "text": "t"}, edge())
+        # Edges that predate subtitles send no segments; newer ones may; bad ones are ignored.
+        variants = [{}, {"segments": "junk"}, {"segments": [{"start": 0, "end": 1, "text": "t"}]}]
+        statuses = [http("POST", "/queue/complete", {"handle": r["handle"], "text": "t", **variants[i % 3]}, edge())[0]
+                    for i, r in enumerate(rest + [m])]
+        check("complete takes optional segments, and a malformed one does not fail the job",
+              statuses == [200] * 4, statuses)
+        check("...and a voice note's segments make no subtitles",
+              q("SELECT count(*) FROM outbox WHERE action = 'document'")[0][0] == 0)
         post_webhook(wa_payload([wa_msg("anon")]))
         anon = json.loads(http("POST", "/queue/lease", {"max": 1, "wait": 0}, edge(inst=None))[1])["jobs"]
         check("valid token without X-Instance-Id is accepted as \"unknown\"",

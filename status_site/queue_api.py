@@ -43,6 +43,7 @@ import limits
 import messages
 import offers
 import outbox
+import srt
 import stats
 import telegram
 import whatsapp
@@ -68,6 +69,28 @@ MAX_BATCH = 100
 
 # Voice messages and clips; the only lane edges lease.
 INTERACTIVE = "interactive"
+
+# A video's subtitles, sent after its transcript where the channel takes files.
+SUBTITLES_FILENAME = "transcript.srt"
+
+# Videos to send back with their subtitles burned in, for render workers
+# (render_worker.py) - never handed to a transcription edge. Off unless a render worker
+# runs: without one, these jobs would only wait out their max age.
+RENDER = "render"
+RENDER_ENABLED = os.environ.get("RENDER_ENABLED", "").lower() in ("1", "true", "yes")
+# How long (from when the video was sent) a render job may wait or retry before the user
+# gets the .srt instead. Well under the outbox's max age, so that .srt still goes out.
+RENDER_MAX_AGE_SECONDS = int(os.environ.get("RENDER_MAX_AGE_SECONDS", "1800"))
+# A render job's lease: longer than a voice message's, as a render takes longer, and
+# longer than a render worker's time budget (RENDER_BUDGET_SECONDS) plus the video's
+# download and upload, so no second worker leases a job that is still rendering.
+RENDER_LEASE_SECONDS = int(os.environ.get("RENDER_LEASE_SECONDS", "3600"))
+# Videos larger than this are not rendered (they get the .srt): the hard cap on what a
+# render worker downloads and re-encodes, should TELEGRAM_MAX_FILE_MB be raised.
+RENDER_MAX_INPUT_BYTES = int(float(os.environ.get("RENDER_MAX_INPUT_MB", "50")) * 1024 * 1024)
+# What a render worker may hand back: the Bot API's upload limit for bots.
+MAX_RENDER_BYTES = 50 * 1024 * 1024
+RENDER_FILENAME = "video_with_subtitles.mp4"
 
 # Platform adapters by queue source: parse(body), target(parsed), open_media(media).
 # "app" is the ivrit.ai app, whose replies go to app_jobs rather than the outbox.
@@ -347,14 +370,19 @@ def sweep():
             WHERE ({EXPIRES} < now() AND NOT ({LIVE}))
                OR (receive_count >= %(max)s AND visible_at <= now())
             RETURNING id, source, lane, receive_count, job_id, {EXPIRES} < now() AS expired,
-                      extract(epoch FROM now() - sent_at)::int AS age_seconds;
+                      extract(epoch FROM now() - sent_at)::int AS age_seconds,
+                      targets, spec, extract(epoch FROM sent_at)::float8 AS sent_at;
             """,
             _params(),
         )
         dropped = cur.fetchall()
+        for r in dropped:
+            if r["lane"] == RENDER:
+                # No render worker got to it (or none could): the .srt instead.
+                _subtitles_instead(cur, r, r["targets"], f"render{r['id']}")
         ivrit_app.expire(cur, [r["job_id"] for r in dropped if r["source"] == "app"])
         ivrit_app.sweep(cur)
-        credits.dropped(cur, [r for r in dropped if r["lane"] != INTERACTIVE])
+        credits.dropped(cur, [r for r in dropped if r["lane"] not in (INTERACTIVE, RENDER)])
         credits.sweep(cur)
         limits.sweep(cur)
         expired_replies = outbox.sweep_expired(cur, MAX_AGE_SECONDS)
@@ -365,7 +393,8 @@ def sweep():
             "WHERE seen_at < now() - make_interval(secs => %s::double precision);",
             (MAX_AGE_SECONDS,),
         )
-        count_dropped(cur, len(dropped) + expired_replies)
+        # A render job left undone is not a lost message: its transcript went out.
+        count_dropped(cur, len([r for r in dropped if r["lane"] != RENDER]) + expired_replies)
         conn.commit()
     if expired_replies:
         log.warning("dropping %s unsent repl(ies) past the %ss max age", expired_replies, MAX_AGE_SECONDS)
@@ -421,10 +450,11 @@ async def _json_body(request):
     return body if isinstance(body, dict) else {}
 
 
-def _try_lease(n, min_depth, edge, pool=None, min_wait=0):
-    """Lease up to n voice messages. An overflow edge leases only what sits above
-    min_depth, or what has waited longer than min_wait seconds; one leasing for a pool
-    (its RunPod endpoint) gets no more than the pool has free."""
+def _try_lease(n, min_depth, edge, pool=None, min_wait=0, lane=INTERACTIVE):
+    """Lease up to n voice messages (or, for a render worker, videos to subtitle). An
+    overflow edge leases only what sits above min_depth, or what has waited longer than
+    min_wait seconds; one leasing for a pool (its RunPod endpoint) gets no more than the
+    pool has free."""
     with db.pool().connection() as conn, conn.cursor() as cur:
         capacity = None
         if pool:
@@ -468,33 +498,42 @@ def _try_lease(n, min_depth, edge, pool=None, min_wait=0):
               pool           = %(pool)s
             FROM picked p
             WHERE q.id = p.id
-            RETURNING q.id, q.source, q.body, q.receipt_handle, q.receive_count, q.job_id,
+            RETURNING q.id, q.source, q.body, q.receipt_handle, q.receive_count, q.job_id, q.lane, q.spec,
                       extract(epoch FROM q.sent_at)::float8 AS sent_at;
             """,
-            _params(n=n, vis=VISIBILITY_TIMEOUT, edge=edge, lane=INTERACTIVE, pool=pool),
+            _params(n=n, vis=RENDER_LEASE_SECONDS if lane == RENDER else VISIBILITY_TIMEOUT,
+                    edge=edge, lane=lane, pool=pool),
         )
         rows = cur.fetchall()
         conn.commit()
     return rows
 
 
-def _jobs_for(rows, edge, uptime, client_ip):
+def _jobs_for(rows, edge, uptime, client_ip, lane=INTERACTIVE):
     """Describe leased rows as jobs, record the edge's heartbeat, and count each message
-    once, on its first lease."""
+    once, on its first lease. Render workers are not transcription edges: they get their
+    jobs and nothing is recorded."""
     jobs, events, after = [], [], []
     for r in rows:
         parsed = SOURCES[r["source"]].parse(r["body"])
-        jobs.append({
+        job = {
             "handle": r["receipt_handle"],
             "kind": parsed["kind"],
             "mime_type": (parsed["media"] or {}).get("mime_type"),
             "sent_at": r["sent_at"],
-        })
+        }
+        if r["lane"] == RENDER:
+            # The message was counted when it was transcribed.
+            jobs.append({**job, "kind": RENDER, "srt": (r["spec"] or {}).get("srt", "")})
+            continue
+        jobs.append(job)
         if r["receive_count"] == 1:
             events.append({"kind": "message", "ts": time.time(), "message_type": parsed["type"],
                            "user_hash": stats.user_hash(parsed["user_key"])})
             after.append((parsed["user_key"], {"user": parsed["user_key"], "type": parsed["type"],
                                                 "job_id": r["job_id"]}))
+    if lane == RENDER:
+        return jobs
     with db.pool().connection() as conn, conn.cursor() as cur:
         stats.heartbeat(cur, edge, uptime, None, client_ip)
         minutes = stats.write_events(cur, edge, events)
@@ -515,22 +554,29 @@ async def lease(request: Request, edge: str = Depends(require_edge)):
     pool = payload.get("pool") or None
     if pool is not None and not isinstance(pool, str):
         raise HTTPException(status_code=400, detail="bad pool")
+    # Edges name no lane and get voice messages, as always; render workers ask for videos.
+    lane = payload.get("lane") or INTERACTIVE
+    if lane not in (INTERACTIVE, RENDER):
+        raise HTTPException(status_code=400, detail="bad lane")
+    if lane == RENDER:
+        pool, min_depth, min_wait = None, 0, 0
 
     # Long poll without holding a thread: each attempt runs on the threadpool, and the
     # wait between attempts is an await, so idle edges cost nothing.
-    rows = await long_poll(lambda: _try_lease(n, min_depth, edge, pool, min_wait), wait) or []
+    rows = await long_poll(lambda: _try_lease(n, min_depth, edge, pool, min_wait, lane), wait) or []
 
-    log.debug("lease edge=%s max=%s wait=%s min_depth=%s pool=%s -> %s", edge, n, wait, min_depth, pool, len(rows))
+    log.debug("lease edge=%s lane=%s max=%s wait=%s min_depth=%s pool=%s -> %s",
+              edge, lane, n, wait, min_depth, pool, len(rows))
     client_ip = request.client.host if request.client else None
     uptime = float(payload.get("uptime_seconds") or 0)
-    jobs = await run_in_threadpool(_jobs_for, rows, edge, uptime, client_ip)
+    jobs = await run_in_threadpool(_jobs_for, rows, edge, uptime, client_ip, lane)
     return {"jobs": jobs}
 
 
 def _leased(cur, handle, lock=False):
     """The job behind a receipt handle, or None if that lease no longer holds it."""
     cur.execute(
-        "SELECT id, source, body, job_id, targets, admission, "
+        "SELECT id, source, body, job_id, targets, admission, lane, spec, "
         "extract(epoch FROM sent_at)::float8 AS sent_at "
         "FROM queue_messages WHERE receipt_handle = %s" + (" FOR UPDATE;" if lock else ";"),
         (handle,),
@@ -666,11 +712,21 @@ async def admit(request: Request, edge: str = Depends(require_edge)):
     return {"ok": ok}
 
 
-def _complete(handle, text, error, transcription_seconds, duration, edge):
+def is_video(parsed):
+    """A video message (or a video sent as a file): its transcript also gets subtitles."""
+    if parsed["type"] in ("video", "video_note"):
+        return True
+    return parsed["type"] == "document" and ((parsed["media"] or {}).get("mime_type") or "").startswith("video/")
+
+
+def _complete(handle, text, error, transcription_seconds, duration, edge, segments=None):
     """Turn a finished job into its reply, atomically: the outbox rows and the job's
     removal commit together, so a transcript is never lost between edge and user.
     Returns False if this lease no longer holds the job (another edge has it, or it
-    expired) - unless this very call already succeeded, which makes retries safe."""
+    expired) - unless this very call already succeeded, which makes retries safe.
+
+    segments (srt.clean()ed) are a video's timings: channels that can send files also
+    get its subtitles, as an .srt after the transcript."""
     after = []
     with db.pool().connection() as conn, conn.cursor() as cur:
         row, parsed, targets = _leased(cur, handle, lock=True)
@@ -688,6 +744,15 @@ def _complete(handle, text, error, transcription_seconds, duration, edge):
             # Fetched by the app, not sent: no outbox, no nudge, no notices.
             ivrit_app.finish(cur, parsed, handle, text if transcribed else None, error, seconds)
             targets = []
+        subtitles = ""
+        media = parsed["media"] or {}
+        if transcribed and segments and is_video(parsed):
+            subtitles = srt.render(segments)
+        # Where a render worker will send the video back with its subtitles burned in,
+        # the .srt goes out only if the video never does (see _subtitles_instead).
+        video_targets = []
+        if subtitles and RENDER_ENABLED and (media.get("size") or 0) <= RENDER_MAX_INPUT_BYTES:
+            video_targets = [t for t in targets if outbox.can_send_video(t)]
         for i, target in enumerate(targets):
             # Users still getting transcripts on WhatsApp are told WhatsApp now charges
             # for these messages, after each one - except allowlisted numbers, which
@@ -698,7 +763,8 @@ def _complete(handle, text, error, transcription_seconds, duration, edge):
                 if not (owner and owner["wa_replies_allowed"]):
                     notice = messages.WA_PRICING_NOTICE
             outbox.enqueue_text(
-                cur, target, reply, row["sent_at"], extra=[notice, nudge],
+                cur, target, reply, row["sent_at"],
+                extra=[notice, nudge],
                 source_handle=handle if i == 0 else f"{handle}#{i}", transcript=transcribed,
                 meta=meta,
             )
@@ -706,6 +772,14 @@ def _complete(handle, text, error, transcription_seconds, duration, edge):
                 # The notice points to the instructions, so the number counts as told:
                 # once replies are off, it is not billed for another.
                 identity.mark_wa_told(cur, target["address"])
+            if subtitles and target not in video_targets:
+                outbox.enqueue_document(
+                    cur, target, SUBTITLES_FILENAME, subtitles.encode("utf-8"), row["sent_at"],
+                    caption=messages.SUBTITLES_CAPTION, source_handle=f"{handle}#srt{i}",
+                )
+        if video_targets:
+            enqueue(cur, row["source"], row["body"], row["sent_at"], row["job_id"], targets=video_targets,
+                    lane=RENDER, spec={"srt": subtitles}, max_age=RENDER_MAX_AGE_SECONDS)
         minutes = []
         if transcribed:
             admission = row["admission"] or {}
@@ -740,13 +814,97 @@ async def complete(request: Request, edge: str = Depends(require_edge)):
     text = payload.get("text")
     if error is None and not isinstance(text, str):
         raise HTTPException(status_code=400, detail="text or error required")
+    segments = None
+    if error is None and "segments" in payload:
+        segments = srt.clean(payload["segments"])
+        if segments is None:
+            log.warning("complete edge=%s handle=%s: ignoring malformed segments", edge, handle)
     done = await run_in_threadpool(
         _complete, handle, text, error, payload.get("transcription_seconds"),
-        payload.get("duration"), edge,
+        payload.get("duration"), edge, segments,
     )
     if not done:
         raise HTTPException(status_code=409, detail="lease no longer held")
     log.debug("complete edge=%s handle=%s error=%s", edge, handle, error)
+    return {"ok": True}
+
+
+def _subtitles_instead(cur, row, targets, key):
+    """A render job that will not deliver its video: send the .srt it was standing in
+    for, so the user is not left with only the promise of one."""
+    srt_text = (row["spec"] or {}).get("srt")
+    if not srt_text:
+        return
+    for i, target in enumerate(targets or []):
+        outbox.enqueue_document(cur, target, SUBTITLES_FILENAME, srt_text.encode("utf-8"), row["sent_at"],
+                                caption=messages.SUBTITLES_CAPTION, source_handle=f"{key}#srt{i}")
+
+
+def _rendered(handle, data, meta, error, edge):
+    """Close a render job: queue its video to each target, or (with error) its .srt
+    instead. Atomic like _complete, and safe to repeat. None if the handle is not a
+    render job's."""
+    with db.pool().connection() as conn, conn.cursor() as cur:
+        row, parsed, targets = _leased(cur, handle, lock=True)
+        if row is None:
+            cur.execute("SELECT 1 FROM outbox WHERE source_handle = %s;", (f"{handle}#video0",))
+            return cur.fetchone() is not None or error is not None
+        if row["lane"] != RENDER:
+            return None
+        if error is None:
+            for i, target in enumerate(targets):
+                outbox.enqueue_video(cur, target, RENDER_FILENAME, data, row["sent_at"], meta,
+                                     caption=messages.RENDERED_CAPTION, source_handle=f"{handle}#video{i}")
+        else:
+            log.info("render job %s dropped by %s: %s", row["id"], edge, error)
+            _subtitles_instead(cur, row, targets, f"render{row['id']}")
+        cur.execute("DELETE FROM queue_messages WHERE id = %s;", (row["id"],))
+        conn.commit()
+    return True
+
+
+@queue_api.post("/queue/rendered/{handle}")
+async def rendered(handle: str, request: Request, edge: str = Depends(require_edge)):
+    """A render worker hands back the subtitled video: the mp4 as the body, its
+    dimensions and duration in X-Width, X-Height, X-Duration."""
+    if (request.headers.get("Content-Type") or "").split(";")[0].strip().lower() != "video/mp4":
+        raise HTTPException(status_code=415, detail="video/mp4 only")
+    try:
+        declared = int(request.headers.get("Content-Length") or 0)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="bad length")
+    if declared > MAX_RENDER_BYTES:
+        raise HTTPException(status_code=413, detail="too large")
+    data = bytearray()
+    async for chunk in request.stream():
+        data += chunk
+        if len(data) > MAX_RENDER_BYTES:
+            raise HTTPException(status_code=413, detail="too large")
+    if not data:
+        raise HTTPException(status_code=400, detail="empty")
+    try:
+        meta = {k: int(float(request.headers.get(f"X-{k.title()}") or 0)) for k in ("width", "height", "duration")}
+    except ValueError:
+        raise HTTPException(status_code=400, detail="bad dimensions")
+    done = await run_in_threadpool(_rendered, handle, bytes(data), meta, None, edge)
+    if done is None:
+        raise HTTPException(status_code=400, detail="not a render job")
+    if not done:
+        raise HTTPException(status_code=409, detail="lease no longer held")
+    return {"ok": True}
+
+
+@queue_api.post("/queue/render-failed")
+async def render_failed(request: Request, edge: str = Depends(require_edge)):
+    """A render worker gives up on a video for good (it will not fit, it will not
+    decode): drop the job rather than retry it."""
+    payload = await _json_body(request)
+    handle = payload.get("handle")
+    if not handle:
+        raise HTTPException(status_code=400, detail="handle required")
+    done = await run_in_threadpool(_rendered, handle, None, None, str(payload.get("error") or "failed"), edge)
+    if done is None:
+        raise HTTPException(status_code=400, detail="not a render job")
     return {"ok": True}
 
 

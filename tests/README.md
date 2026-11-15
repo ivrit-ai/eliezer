@@ -7,16 +7,17 @@ using real audio generated with ffmpeg.
 
 | Suite | Covers |
 |---|---|
-| `test_queue.py` | Queue mechanics: signed webhooks, dedup, batch splitting, expiry and the sweeper, poison messages, the overflow threshold, edge auth, long-polls, prompt SIGTERM. |
+| `test_srt.py` | Subtitles (`status_site/srt.py`), no Docker: validation of the segments edges send, SRT output (one cue per segment) with right-to-left marks. |
+| `test_queue.py` | Queue mechanics: signed webhooks, dedup, batch splitting, expiry and the sweeper, poison messages, the overflow threshold, edge auth, long-polls, prompt SIGTERM, optional segments on completion. |
 | `test_whatsapp.py` | The WhatsApp path end to end: media through the hub, admission (10-minute cap, fleet-wide rate limits), transcripts-only WhatsApp replies, the pricing notice, long replies, send retries and resumption, safe completion retries, statistics. |
-| `test_telegram.py` | Telegram, linking and admin: link flow, delivery to Telegram, the reply policy and allowlist, unlink and blocked bots, groups and `/transcribe`, group and sent-message counters, recovery from media failures. |
+| `test_telegram.py` | Telegram, linking and admin: link flow, delivery to Telegram, the reply policy and allowlist, unlink and blocked bots, groups and `/transcribe`, group and sent-message counters, recovery from media failures, videos answered with their transcript and an `.srt`, and (with a real render worker and ffmpeg) the video with its subtitles burned in. |
 | `test_notifier.py` | The Notifier app as an output: linking by code from WhatsApp and from a Telegram deep link, transcripts to the app instead of WhatsApp, a number moving to Telegram keeping its app, `/unlink` with an app linked, retries on 429, unbinding on 410, dashboard counters. |
 | `test_app.py` | The ivrit.ai app as a source: Google ID tokens (issuer, audience, expiry, signature, verified email), upload limits (type, 20 MB, three waiting per account), the real edge transcribing app uploads (direct and converted), refusals reported to the app (too long, unsupported, hourly limit per account), results only to the app (never the outbox), and CORS for the app's origin. |
 | `test_credits.py` | Credits for the ivrit.ai app's files: the app server's token, the weekly quota (charged at registration, refunded once on cancel, expiry or failure), lanes and the shared RunPod pool's capacity, round-robin between owners with one running each, long files limited to their share, an overflow edge leasing for the pool alongside, a retried admit charged once, heartbeats and progress, a lapsed credit granted again with its backend ref, cancel through the heartbeat, byok pools sized by the job, the sweeper sparing held jobs, buckets surviving a restart, and long-polls woken by new work. |
 
 ## Running
 
-Needs Docker, `ffmpeg`/`ffprobe`, and the hub's and edge's dependencies:
+Needs Docker, `ffmpeg`/`ffprobe` (with libass, for the render worker check), and the hub's and edge's dependencies:
 
 ```bash
 pip install -r status_site/requirements.txt -r requirements.txt

@@ -1,6 +1,7 @@
 # Eliezer
 
-Transcribes WhatsApp voice notes. Two parts:
+Transcribes WhatsApp voice notes, and Telegram voice notes and videos (a video also gets
+its subtitles back, as an `.srt` after the transcript). Two parts:
 
 - **The status site** (`status_site/`, deployed on xhostd) is the hub.
   It receives the WhatsApp webhook, queues voice notes, answers everything that isn't a
@@ -20,6 +21,34 @@ python whatsapp_bot.py            # or transcribe on RunPod (needs RUNPOD_* in .
 
 `--num-workers N` sets concurrent transcriptions (default 1 with `--local`, else 10).
 `--overflow-handler N` makes the edge take work only while more than N jobs are waiting.
+
+## Running a render worker (optional)
+
+A video sent on Telegram gets its transcript and an `.srt`. With `RENDER_ENABLED=1` on
+the hub, it instead gets its transcript and then the video back with the subtitles
+burned in, made by a render worker: a separate, CPU-bound
+process that leases the hub's `render` lane (transcription edges never see it), so
+rendering never slows transcription. If no render worker delivers within
+`RENDER_MAX_AGE_SECONDS` (default 30 minutes), or one gives up on the video, the user
+gets the `.srt` after all.
+
+```bash
+# same .env as an edge (queue URL and token); needs ffmpeg with libass and a font
+# with Hebrew - on Debian/Ubuntu: apt install ffmpeg fonts-noto-core
+python render_worker.py
+```
+
+Output is at most 720p and under the Bot API's 50MB upload limit (compressed further
+when needed). `SUB_FONT`, `RENDER_MAX_HEIGHT` and `RENDER_MAX_OUTPUT_MB` tune it.
+
+Hard caps, so raising `TELEGRAM_MAX_FILE_MB` (the hub's refusal size, 20MB by default -
+the public Bot API's limit) never means rendering anything that arrives: the hub queues
+no render job for a video over `RENDER_MAX_INPUT_MB` (default 50), and the worker gives
+up on one that downloads larger than that, runs longer than `RENDER_MAX_SECONDS`
+(default 600), or takes longer than `RENDER_BUDGET_SECONDS` (default 1800) to encode.
+Those get the `.srt` instead. The hub leases a render job for `RENDER_LEASE_SECONDS`
+(default 3600, more than the budget plus the download and upload), so no second worker
+takes a video that is still rendering.
 
 ## The status page FAQ
 

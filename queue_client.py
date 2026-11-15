@@ -22,6 +22,10 @@ class StaleJob(Exception):
     was dropped. Nothing to do but let it go."""
 
 
+class MediaTooLarge(Exception):
+    """The job's media is larger than the caller will take."""
+
+
 class QueueClient:
     def __init__(self, base_url, token, instance_id):
         self.base_url = base_url.rstrip("/")
@@ -32,12 +36,14 @@ class QueueClient:
         self.session.headers["X-Edge-Protocol"] = "2"
         self.started = time.time()
 
-    def _post(self, path, payload, timeout=REQUEST_TIMEOUT, retries=RETRIES):
+    def _post(self, path, payload=None, timeout=REQUEST_TIMEOUT, retries=RETRIES, data=None, headers=None):
         # A lost admit or complete costs a whole re-transcription once the lease times
         # out, so transient failures are worth a few attempts. Both are safe to repeat.
+        # data/headers: a raw body instead of JSON (a rendered video).
         for attempt in range(retries):
             try:
-                r = self.session.post(f"{self.base_url}{path}", json=payload, timeout=timeout)
+                r = self.session.post(f"{self.base_url}{path}", json=payload, data=data, headers=headers,
+                                      timeout=timeout)
                 if r.status_code == 409:
                     raise StaleJob(r.text)
                 r.raise_for_status()
@@ -51,28 +57,30 @@ class QueueClient:
                     raise
                 time.sleep(0.5 * (attempt + 1))
 
-    def lease(self, max_jobs, wait_seconds, min_depth=0, pool=None, min_wait=0):
+    def lease(self, max_jobs, wait_seconds, min_depth=0, pool=None, min_wait=0, lane=None):
         """Up to max_jobs jobs, long-polling up to wait_seconds. Doubles as this edge's
         heartbeat, so it carries the uptime. An edge transcribing on RunPod names its
         pool, so the site never hands it more than the endpoint has room for (the app's
-        files share it)."""
-        return self._post(
-            "/queue/lease",
-            {"max": max_jobs, "wait": wait_seconds, "min_depth": min_depth, "pool": pool,
-             "min_wait": min_wait, "uptime_seconds": time.time() - self.started},
-            timeout=(5, wait_seconds + 15),
-            retries=1,
-        )["jobs"]
+        files share it). A render worker asks for lane "render"."""
+        payload = {"max": max_jobs, "wait": wait_seconds, "min_depth": min_depth, "pool": pool,
+                   "min_wait": min_wait, "uptime_seconds": time.time() - self.started}
+        if lane:
+            payload["lane"] = lane
+        return self._post("/queue/lease", payload, timeout=(5, wait_seconds + 15), retries=1)["jobs"]
 
-    def fetch_media(self, handle, path):
-        """Download the job's media to path."""
+    def fetch_media(self, handle, path, max_bytes=None):
+        """Download the job's media to path; past max_bytes, stop and raise MediaTooLarge."""
         with self.session.get(f"{self.base_url}/queue/media/{handle}", stream=True,
                               timeout=MEDIA_TIMEOUT) as r:
             if r.status_code == 404:
                 raise StaleJob(r.text)
             r.raise_for_status()
+            received = 0
             with open(path, "wb") as f:
                 for chunk in r.iter_content(chunk_size=64 * 1024):
+                    received += len(chunk)
+                    if max_bytes and received > max_bytes:
+                        raise MediaTooLarge(f"over {max_bytes} bytes")
                     f.write(chunk)
 
     def admit(self, handle, duration):
@@ -85,12 +93,31 @@ class QueueClient:
         lease would lapse."""
         self._post("/queue/release", {"handle": handle}, retries=1)
 
-    def complete(self, handle, text=None, error=None, transcription_seconds=None, duration=None):
-        """Hand back the transcript (or the reason there is none); the site replies."""
-        self._post("/queue/complete", {
+    def complete(self, handle, text=None, error=None, transcription_seconds=None, duration=None,
+                 segments=None):
+        """Hand back the transcript (or the reason there is none); the site replies.
+        segments are its timings ([{start, end, text}]), for subtitles; sites that
+        predate them ignore the field."""
+        payload = {
             "handle": handle, "text": text, "error": error,
             "transcription_seconds": transcription_seconds, "duration": duration,
-        })
+        }
+        if segments:
+            payload["segments"] = segments
+        self._post("/queue/complete", payload)
+
+
+    def rendered(self, handle, path, width, height, duration):
+        """Hand back a render job's video (an mp4); the site sends it to the user."""
+        with open(path, "rb") as f:
+            data = f.read()
+        self._post(f"/queue/rendered/{handle}", data=data, timeout=MEDIA_TIMEOUT,
+                   headers={"Content-Type": "video/mp4", "X-Width": str(width),
+                            "X-Height": str(height), "X-Duration": str(duration)})
+
+    def render_failed(self, handle, error):
+        """Give up on a render job for good (it will never fit or decode)."""
+        self._post("/queue/render-failed", {"handle": handle, "error": error})
 
 
 def make_queue_client():

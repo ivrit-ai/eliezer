@@ -15,6 +15,8 @@ import types
 import urllib.error
 import urllib.parse
 import urllib.request
+from email.parser import BytesParser
+from email.policy import default as email_policy
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import psycopg
@@ -50,10 +52,13 @@ def free_port():
 
 LOCK = threading.Lock()
 MEDIA = {}                 # id -> (path, mime)   (WhatsApp media ids and Telegram file ids)
-WA_SENT, TG_SENT, TG_CALLS = [], [], []
+WA_SENT, TG_SENT, TG_CALLS, TG_DOCS, TG_VIDEOS = [], [], [], [], []
 _message_ids = iter(range(5000, 10 ** 9))
 TG_FORBIDDEN = set()       # chat ids answering 403
 FILE_FAIL = {}             # file_id -> status codes its downloads return first, in order
+DOC_FAIL = {}              # chat id -> status codes its sendDocument calls return first
+SLOW_TEXT = {}             # chat id -> seconds its sendMessage calls take
+DELIVERED = []             # (chat id, method) in the order sends completed
 
 
 class Base(BaseHTTPRequestHandler):
@@ -111,9 +116,37 @@ class Telegram(Base):
         if parts[0] != f"bot{TG_TOKEN}":
             return self._json(401, {"ok": False, "description": "Unauthorized"})
         method = parts[1]
-        data = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0) or b"{}") or b"{}")
+        raw = self.rfile.read(int(self.headers.get("Content-Length") or 0))
+        ctype = self.headers.get("Content-Type", "")
+        if ctype.startswith("multipart/form-data"):
+            # Files (sendDocument): form fields are strings, objects arrive as JSON.
+            form = BytesParser(policy=email_policy).parsebytes(
+                b"Content-Type: " + ctype.encode() + b"\r\n\r\n" + raw)
+            data = {}
+            for part in form.iter_parts():
+                name = part.get_param("name", header="content-disposition")
+                body = part.get_payload(decode=True)
+                data[name] = {"filename": part.get_filename(), "bytes": body} if part.get_filename() else body.decode()
+        else:
+            data = json.loads(raw or b"{}")
+        slow = SLOW_TEXT.get(str(data.get("chat_id"))) if method == "sendMessage" else None
+        if slow:
+            time.sleep(slow)
         with LOCK:
             TG_CALLS.append((method, data))
+            if method in ("sendMessage", "sendDocument", "sendVideo"):
+                DELIVERED.append((str(data.get("chat_id")), method))
+            if method == "sendDocument":
+                pending = DOC_FAIL.get(str(data["chat_id"]))
+                code = pending.pop(0) if pending else None
+                if code == 429:
+                    return self._json(429, {"ok": False, "error_code": 429, "description": "Too Many Requests",
+                                            "parameters": {"retry_after": 1}})
+                if code:
+                    return self._json(code, {"ok": False, "error_code": code, "description": "error"})
+                TG_DOCS.append(data)
+            if method == "sendVideo":
+                TG_VIDEOS.append(data)
             if method == "sendMessage":
                 if str(data["chat_id"]) in TG_FORBIDDEN:
                     return self._json(403, {"ok": False, "error_code": 403,
@@ -161,6 +194,16 @@ def wa_reactions(mid=None):
                 and (mid is None or m.get("reaction", {}).get("message_id") == mid)]
 
 
+def tg_docs(chat):
+    with LOCK:
+        return [d for d in TG_DOCS if str(d["chat_id"]) == str(chat)]
+
+
+def tg_videos(chat):
+    with LOCK:
+        return [d for d in TG_VIDEOS if str(d["chat_id"]) == str(chat)]
+
+
 def tg_calls(method, chat=None):
     with LOCK:
         return [d for m, d in TG_CALLS if m == method and (chat is None or str(d.get("chat_id")) == str(chat))]
@@ -200,7 +243,7 @@ def wa(frm, mtype="audio", text=None, media="m-short"):
 
 
 def tg(chat, text=None, voice=None, document=None, chat_type="private", update_id=None, secret=TG_SECRET,
-       sender=None, reply_to=None):
+       sender=None, reply_to=None, video=None, video_note=None):
     uid = update_id or next(_ids)
     msg = {"message_id": next(_ids), "date": int(time.time()), "chat": {"id": int(chat), "type": chat_type},
            "from": {"id": int(sender or chat), "first_name": "T"}}
@@ -212,6 +255,12 @@ def tg(chat, text=None, voice=None, document=None, chat_type="private", update_i
         msg["voice"] = {"file_id": voice, "mime_type": "audio/ogg", "file_size": 11906, "duration": 3}
     if document:
         msg["document"] = document
+    if video:
+        msg["video"] = {"file_id": video, "mime_type": "video/mp4", "file_size": 40000, "duration": 3,
+                        "width": 320, "height": 240}
+    if video_note:
+        # Round video messages carry no mime type.
+        msg["video_note"] = {"file_id": video_note, "file_size": 40000, "duration": 3, "length": 240}
     st, _ = http("POST", "/webhook/telegram", {"update_id": uid, "message": msg},
                  headers={"X-Telegram-Bot-Api-Secret-Token": secret})
     return st, msg["message_id"], uid
@@ -244,7 +293,11 @@ def token_from(messages):
 # ---------------------------------------------------------------- main
 def main():
     MEDIA.update({"m-short": (os.path.join(FIX, "short.ogg"), "audio/ogg"),
-                  "f-short": (os.path.join(FIX, "short.ogg"), "audio/ogg")})
+                  "f-short": (os.path.join(FIX, "short.ogg"), "audio/ogg"),
+                  "f-clip": (os.path.join(FIX, "clip.mp4"), "video/mp4"),
+                  "f-song": (os.path.join(FIX, "song.mp3"), "audio/mpeg"),
+                  # says video, holds only sound: transcribed, but nothing to burn subtitles into
+                  "f-novid": (os.path.join(FIX, "short.ogg"), "video/mp4")})
     graph = ThreadingHTTPServer(("127.0.0.1", 0), Graph)
     tgapi = ThreadingHTTPServer(("127.0.0.1", 0), Telegram)
     for s in (graph, tgapi):
@@ -265,7 +318,7 @@ def main():
                TELEGRAM_BOT_TOKEN=TG_TOKEN, TELEGRAM_API_URL=f"http://127.0.0.1:{tgapi.server_port}",
                TELEGRAM_WEBHOOK_URL=f"{HUB}/webhook/telegram", ADMIN_TG_CHAT_IDS=ADMIN,
                STATUS_USER_SALT="salt", NUDGE_INTERVAL="1000000", QUEUE_SWEEP_INTERVAL_SECONDS="1",
-               LOG_LEVEL="DEBUG", PORT=str(HUB_PORT))
+               LOG_LEVEL="DEBUG", PORT=str(HUB_PORT), RENDER_ENABLED="1", RENDER_MAX_INPUT_MB="1")
     hubdir = os.path.join(REPO, "status_site")
     py = sys.executable
     subprocess.run([py, "-c", "import app; app.init_db(); app.init_queue_db()"], cwd=hubdir, env=env, check=True)
@@ -335,6 +388,130 @@ def main():
         tg("222", document={"file_id": "f-big", "file_size": 30 * 1024 * 1024, "mime_type": "audio/mpeg"})
         wait_for(lambda: len(tg_to("222")) >= 2)
         check("files over 20MB are refused up front", "20MB" in tg_to("222")[-1]["text"])
+
+        # ===== videos: the transcript, then the video with its subtitles burned in by a
+        # render worker (RENDER_ENABLED); the .srt only when the video never comes.
+        _, vid, _ = tg("350", video="f-clip")
+        wait_for(lambda: tg_to("350"), 30)
+        texts = tg_to("350")
+        check("a video sent in Telegram is transcribed as a quoted reply",
+              any(m["text"] == "hello world" and m.get("reply_parameters", {}).get("message_id") == vid
+                  for m in texts), texts)
+        time.sleep(1)
+        check("...and no .srt while its video is coming", not tg_docs("350"))
+        _, vn, _ = tg("350", video_note="f-clip")
+        _, vmid, _ = tg("350", voice="f-short")
+        tg("350", document={"file_id": "f-song", "file_size": 20000, "mime_type": "audio/mpeg",
+                            "file_name": "song.mp3"})
+        wait_for(lambda: sum(m["text"] == "hello world" for m in tg_to("350")) >= 4, 30)
+        time.sleep(1)
+        check("a round video message, a voice note or an audio file: only its transcript, for now",
+              sum(m["text"] == "hello world" for m in tg_to("350")) == 4 and not tg_docs("350"),
+              [m["text"][:20] for m in tg_to("350")])
+        tg("352", document={"file_id": "f-novid", "file_size": 20000, "mime_type": "video/mp4",
+                            "file_name": "clip.mp4"})
+        tg("353", video="f-clip")
+        wait_for(lambda: q("SELECT count(*) FROM queue_messages WHERE lane = 'render'")[0][0] == 4, 30)
+        renders = q("SELECT targets FROM queue_messages WHERE lane = 'render'")
+        check("each video queues a render job for its Telegram chat",
+              len(renders) == 4 and all(r[0][0]["channel"] == "telegram" for r in renders), renders)
+        time.sleep(2)
+        check("...which transcription edges never lease",
+              q("SELECT count(*) FROM queue_messages WHERE lane = 'render' AND receipt_handle IS NOT NULL")[0][0] == 0)
+
+        # No render worker gets to 353's video in time: it gets the .srt instead.
+        dropped_before = q("SELECT dropped FROM totals")[0][0]
+        q("UPDATE queue_messages SET expires_at = now() - interval '1 second' "
+          "WHERE lane = 'render' AND targets->0->>'address' = '353' RETURNING id")
+        wait_for(lambda: tg_docs("353"), 15)
+        docs = tg_docs("353")
+        doc = docs[0] if docs else {}
+        body = (doc.get("document") or {}).get("bytes", b"").decode("utf-8", "replace")
+        check("a render job that expires sends the subtitles as transcript.srt instead",
+              len(docs) == 1 and doc["document"]["filename"] == "transcript.srt", docs)
+        check("...an SRT with the transcript's timings, its lines marked right-to-left",
+              body.startswith("1\n00:00:00,000 --> 00:00:01,500\n\u200fhello world\u200f"), repr(body[:80]))
+        check("...quoting the video, with a caption",
+              json.loads(doc.get("reply_parameters", "{}")).get("message_id") and doc.get("caption"), doc)
+        check("...and is not counted as a dropped message",
+              q("SELECT dropped FROM totals")[0][0] == dropped_before, q("SELECT dropped FROM totals"))
+
+        # A render job's lease outlasts a render (and the worker's time budget), unlike a
+        # voice message's: no second worker takes a video that is still rendering.
+        import queue_client
+        probe_queue = queue_client.QueueClient(HUB, QTOK, "render-probe")
+        leased = probe_queue.lease(1, 0, lane="render")
+        lease_minutes = q("SELECT extract(epoch FROM visible_at - now()) / 60 FROM queue_messages "
+                          "WHERE leased_by = 'render-probe'")
+        for job in leased:
+            probe_queue.release(job["handle"])
+        check("a render job is leased for an hour, longer than a render may take",
+              leased and 55 < lease_minutes[0][0] <= 60, lease_minutes)
+
+        DOC_FAIL["352"] = [429]
+        start_render_worker()
+        wait_for(lambda: len(tg_videos("350")) >= 2, 60)
+        vids = tg_videos("350")
+        check("the render worker's video reaches the chat, quoting the video it subtitles",
+              len(vids) == 2 and json.loads(vids[0]["reply_parameters"])["message_id"] in (vid, vn)
+              and vids[0]["video"]["filename"].endswith(".mp4") and vids[0].get("supports_streaming") == "true",
+              [{k: v for k, v in d.items() if k != "video"} for d in vids])
+        out = os.path.join(SP, "rendered.mp4")
+        with open(out, "wb") as f:
+            f.write(vids[0]["video"]["bytes"] if vids else b"")
+        probed = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "stream=codec_type,width,height",
+                                 "-show_entries", "format=duration", "-of", "json", out],
+                                capture_output=True, text=True)
+        info = json.loads(probed.stdout or "{}")
+        kinds = sorted(st.get("codec_type") for st in info.get("streams", []))
+        check("...a playable mp4 with picture and sound, as long as the original",
+              kinds == ["audio", "video"] and abs(float(info["format"]["duration"]) - 3) < 0.6, info)
+        check("...sent with its dimensions",
+              vids and vids[0].get("width") == "320" and vids[0].get("height") == "240", vids and vids[0].get("width"))
+        check("...and no .srt alongside it", not tg_docs("350"))
+
+        wait_for(lambda: tg_docs("352"), 30)
+        check("a 'video' with no picture is given up on, and gets its .srt instead",
+              len(tg_docs("352")) == 1 and not tg_videos("352")
+              and q("SELECT count(*) FROM queue_messages WHERE lane = 'render'")[0][0] == 0)
+        check("...which, refused with 429, is sent again after retry_after",
+              len(tg_calls("sendDocument", "352")) == 2, tg_calls("sendDocument", "352"))
+        check("videos and subtitles count as messages sent to Telegram",
+              q("SELECT tg_sent FROM totals")[0][0] >= 4)
+        check("a sent video leaves no stored file behind",
+              wait_for(lambda: q("SELECT count(*) FROM outbox_files")[0][0] == 0, 10))
+        check("render workers do not show up as transcription edges",
+              q("SELECT count(*) FROM instances WHERE instance_id = 'render-t'")[0][0] == 0
+              and q("SELECT count(*) FROM instances WHERE instance_id = 'edge-t'")[0][0] == 1)
+
+        # A video over RENDER_MAX_INPUT_MB is not rendered: the .srt, after its transcript
+        # however slow that is to send.
+        SLOW_TEXT["354"] = 2
+        tg("354", document={"file_id": "f-clip", "file_size": 2 * 1024 * 1024, "mime_type": "video/mp4",
+                            "file_name": "big.mp4"})
+        wait_for(lambda: tg_docs("354"), 30)
+        order = [m for c, m in DELIVERED if c == "354"]
+        check("a video over the render size cap gets its .srt, and no render job",
+              len(tg_docs("354")) == 1
+              and not q("SELECT 1 FROM queue_messages WHERE lane = 'render' AND targets->0->>'address' = '354'"))
+        check("subtitles wait for the transcript, however slow its send",
+              order[:2] == ["sendMessage", "sendDocument"], order)
+
+        # The render worker's own cap: too long a video is given up on, and gets the .srt.
+        import render_worker
+        render_worker.MAX_SECONDS = 1
+        tg("355", video="f-clip")
+        wait_for(lambda: tg_docs("355"), 60)
+        render_worker.MAX_SECONDS = 600
+        check("a video over the render worker's length cap gets its .srt instead",
+              len(tg_docs("355")) == 1 and not tg_videos("355"))
+        # ...and one that takes longer than its time budget to encode.
+        render_worker.BUDGET_SECONDS = 0.01
+        tg("356", video="f-clip")
+        wait_for(lambda: tg_docs("356"), 60)
+        render_worker.BUDGET_SECONDS = 1800
+        check("a video the render worker cannot encode within its time budget gets its .srt instead",
+              len(tg_docs("356")) == 1 and not tg_videos("356"))
 
         check("transcripts delivered to Telegram carry no pricing notice",
               not any(m["text"].startswith(NOTICE) for m in tg_to("111") + tg_to("222")))
@@ -618,7 +795,7 @@ def main():
         wait_for(lambda: q("SELECT count(*) FROM outbox")[0][0] == 0, 10)
         s = json.loads(http("GET", "/api/stats")[1])
         with LOCK:
-            delivered = len(TG_SENT)
+            delivered = len(TG_SENT) + len(TG_DOCS) + len(TG_VIDEOS)
         check("tg_sent counts every message delivered to Telegram", s["totals"]["tg_sent"] == delivered,
               (s["totals"]["tg_sent"], delivered))
         s = json.loads(http("GET", "/api/stats")[1])
@@ -626,6 +803,7 @@ def main():
               s["linked_users"] >= 2 and s["totals"]["dropped_unlinked"] >= 1, (s["linked_users"], s["totals"]))
 
         EDGE.stop_event.set()
+        RENDER_STOP.set()
         t0 = time.time()
         hub.send_signal(15)
         hub.wait(timeout=30)
@@ -653,6 +831,14 @@ def _up():
 
 
 EDGE = None
+RENDER_STOP = threading.Event()
+
+
+def start_render_worker():
+    import queue_client
+    import render_worker
+    worker_queue = queue_client.QueueClient(HUB, QTOK, "render-t")
+    threading.Thread(target=render_worker.run, args=(worker_queue, RENDER_STOP), daemon=True).start()
 
 
 def start_edge():
@@ -667,7 +853,7 @@ def start_edge():
     import whatsapp_bot
 
     async def fake_segments(self, audio_path):
-        return [types.SimpleNamespace(text="hello world")]
+        return [types.SimpleNamespace(text="hello world", start=0.0, end=1.5)]
     whatsapp_bot.WhatsAppBot._collect_transcription_segments = fake_segments
     EDGE = whatsapp_bot.WhatsAppBot(num_workers=2)
     threading.Thread(target=EDGE.run, daemon=True).start()
