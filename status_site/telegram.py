@@ -28,9 +28,13 @@ WEBHOOK_SECRET = hashlib.sha256(f"eliezer-webhook:{BOT_TOKEN}".encode()).hexdige
 
 # Telegram's limit is 4096; keep some distance from it.
 MAX_TEXT_LENGTH = 4000
-# The Bot API will not hand bots files larger than this.
-MAX_FILE_BYTES = 20 * 1024 * 1024
+# Files larger than this are refused up front. The public Bot API will not hand bots
+# anything over 20MB; a self-hosted Bot API server (TELEGRAM_API_URL) can, so this is
+# also the hard cap on what an edge has to download.
+MAX_FILE_MB = float(os.environ.get("TELEGRAM_MAX_FILE_MB", "20"))
+MAX_FILE_BYTES = int(MAX_FILE_MB * 1024 * 1024)
 REQUEST_TIMEOUT = (10, 30)
+UPLOAD_TIMEOUT = (10, 120)
 MEDIA_TIMEOUT = httpx.Timeout(120.0, connect=10.0)
 
 COMMANDS = [
@@ -145,9 +149,14 @@ def target(parsed):
 
 # --- sending
 
-def _call(method, payload):
+def _call(method, payload, files=None):
+    """A Bot API call: JSON, or multipart form fields plus files when there are files."""
     try:
-        response = requests.post(f"{API_URL}/bot{BOT_TOKEN}/{method}", json=payload, timeout=REQUEST_TIMEOUT)
+        if files:
+            response = requests.post(f"{API_URL}/bot{BOT_TOKEN}/{method}", data=payload, files=files,
+                                     timeout=UPLOAD_TIMEOUT)
+        else:
+            response = requests.post(f"{API_URL}/bot{BOT_TOKEN}/{method}", json=payload, timeout=REQUEST_TIMEOUT)
     except requests.RequestException as e:
         raise SendError(f"network error: {e}", retryable=True)
     try:
@@ -175,6 +184,17 @@ def send_text(address, text, quote=None, buttons=None):
     if buttons:
         payload["reply_markup"] = {"inline_keyboard": [[{"text": b["text"], "url": b["url"]}] for b in buttons]}
     return _call("sendMessage", payload)
+
+
+def send_document(address, filename, data, caption=None, quote=None):
+    """Send a file (a video's subtitles), quoting the message it answers."""
+    payload = {"chat_id": address}
+    if caption:
+        payload["caption"] = caption
+    if quote:
+        # Multipart fields are strings: objects go as JSON.
+        payload["reply_parameters"] = json.dumps({"message_id": quote, "allow_sending_without_reply": True})
+    return _call("sendDocument", payload, files={"document": (filename, data, "application/x-subrip")})
 
 
 def edit_text(address, message_id, text):

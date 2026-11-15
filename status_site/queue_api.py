@@ -43,6 +43,7 @@ import limits
 import messages
 import offers
 import outbox
+import srt
 import stats
 import telegram
 import whatsapp
@@ -68,6 +69,9 @@ MAX_BATCH = 100
 
 # Voice messages and clips; the only lane edges lease.
 INTERACTIVE = "interactive"
+
+# A video's subtitles, sent after its transcript where the channel takes files.
+SUBTITLES_FILENAME = "transcript.srt"
 
 # Platform adapters by queue source: parse(body), target(parsed), open_media(media).
 # "app" is the ivrit.ai app, whose replies go to app_jobs rather than the outbox.
@@ -666,11 +670,21 @@ async def admit(request: Request, edge: str = Depends(require_edge)):
     return {"ok": ok}
 
 
-def _complete(handle, text, error, transcription_seconds, duration, edge):
+def is_video(parsed):
+    """A video message (or a video sent as a file): its transcript also gets subtitles."""
+    if parsed["type"] in ("video", "video_note"):
+        return True
+    return parsed["type"] == "document" and ((parsed["media"] or {}).get("mime_type") or "").startswith("video/")
+
+
+def _complete(handle, text, error, transcription_seconds, duration, edge, segments=None):
     """Turn a finished job into its reply, atomically: the outbox rows and the job's
     removal commit together, so a transcript is never lost between edge and user.
     Returns False if this lease no longer holds the job (another edge has it, or it
-    expired) - unless this very call already succeeded, which makes retries safe."""
+    expired) - unless this very call already succeeded, which makes retries safe.
+
+    segments (srt.clean()ed) are a video's timings: channels that can send files also
+    get its subtitles, as an .srt after the transcript."""
     after = []
     with db.pool().connection() as conn, conn.cursor() as cur:
         row, parsed, targets = _leased(cur, handle, lock=True)
@@ -688,6 +702,9 @@ def _complete(handle, text, error, transcription_seconds, duration, edge):
             # Fetched by the app, not sent: no outbox, no nudge, no notices.
             ivrit_app.finish(cur, parsed, handle, text if transcribed else None, error, seconds)
             targets = []
+        subtitles = ""
+        if transcribed and segments and is_video(parsed):
+            subtitles = srt.render(segments)
         for i, target in enumerate(targets):
             # Users still getting transcripts on WhatsApp are told WhatsApp now charges
             # for these messages, after each one - except allowlisted numbers, which
@@ -706,6 +723,11 @@ def _complete(handle, text, error, transcription_seconds, duration, edge):
                 # The notice points to the instructions, so the number counts as told:
                 # once replies are off, it is not billed for another.
                 identity.mark_wa_told(cur, target["address"])
+            if subtitles:
+                outbox.enqueue_document(
+                    cur, target, SUBTITLES_FILENAME, subtitles.encode("utf-8"), row["sent_at"],
+                    caption=messages.SUBTITLES_CAPTION, source_handle=f"{handle}#srt{i}",
+                )
         minutes = []
         if transcribed:
             admission = row["admission"] or {}
@@ -740,9 +762,14 @@ async def complete(request: Request, edge: str = Depends(require_edge)):
     text = payload.get("text")
     if error is None and not isinstance(text, str):
         raise HTTPException(status_code=400, detail="text or error required")
+    segments = None
+    if error is None and "segments" in payload:
+        segments = srt.clean(payload["segments"])
+        if segments is None:
+            log.warning("complete edge=%s handle=%s: ignoring malformed segments", edge, handle)
     done = await run_in_threadpool(
         _complete, handle, text, error, payload.get("transcription_seconds"),
-        payload.get("duration"), edge,
+        payload.get("duration"), edge, segments,
     )
     if not done:
         raise HTTPException(status_code=409, detail="lease no longer held")
